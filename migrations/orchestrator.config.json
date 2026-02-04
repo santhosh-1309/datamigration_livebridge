@@ -12,26 +12,31 @@
     },
     {
       "name": "user_vehicle",
+       "path": "user_veh_migrate",
       "producer": "producer.js",
       "consumer": "consumer.js"
     },
     {
       "name": "user_booking",
+      "path": "user_booking_migrate",
       "producer": "producer.js",
       "consumer": "consumer.js"
     },
     {
       "name": "admin_comments",
+      "path": "admin_comments_migrate",
       "producer": "producer.js",
       "consumer": "consumer.js"
     },
     {
       "name": "b2b_booking",
+      "path": "b2b_booking_migrate",
       "producer": "producer.js",
       "consumer": "consumer.js"
     },
     {
       "name": "feedback_track",
+      "path": "feedback_track",
       "producer": "producer.js",
       "consumer": "consumer.js"
     }

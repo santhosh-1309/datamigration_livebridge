@@ -1,19 +1,42 @@
 const crypto = require("crypto");
 
-const ALGO = process.env.ENCRYPTION_ALGO;
-const KEY = Buffer.from(process.env.ENCRYPTION_KEY);
-const IV_LENGTH = Number(process.env.ENCRYPTION_IV_LENGTH);
+const algorithm = "aes-256-cbc";
+const key = Buffer.from(
+  "949bd1da5962dcf478f4fd7b625143d7949bd1da5962dcf478f4fd7b625143d7",
+  "hex"
+);
+const iv = Buffer.from("00000000000000000000000000000000", "hex");
 
-function encrypt(text) {
-  const iv = crypto.randomBytes(IV_LENGTH);
-  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
+exports.encrypt = (text) => {
+  if (!text) return null;
 
-  let encrypted = cipher.update(text, "utf8", "hex");
-  encrypted += cipher.final("hex");
+  const cipher = crypto.createCipheriv(algorithm, key, iv);
+  const encrypted = Buffer.concat([
+    cipher.update(text, "utf8"),
+    cipher.final()
+  ]);
 
-  const tag = cipher.getAuthTag().toString("hex");
+  // Return HEX (to be stored using UNHEX in MySQL)
+  return encrypted.toString("hex");
+};
 
-  return `${iv.toString("hex")}:${tag}:${encrypted}`;
-}
+exports.decrypt = (encryptedText) => {
+  if (!encryptedText) return null;
 
-module.exports = { encrypt };
+  try {
+    const encryptedBuffer = Buffer.isBuffer(encryptedText)
+      ? encryptedText
+      : Buffer.from(encryptedText, "hex");
+
+    const decipher = crypto.createDecipheriv(algorithm, key, iv);
+    const decrypted = Buffer.concat([
+      decipher.update(encryptedBuffer),
+      decipher.final()
+    ]);
+
+    return decrypted.toString("utf8");
+  } catch (error) {
+    console.error("❌ Decryption error:", error.message);
+    return null;
+  }
+};

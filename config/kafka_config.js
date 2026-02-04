@@ -11,22 +11,22 @@ const producer = kafka.producer({
 });
 
 // User Register
-const userRegisterConsumer = kafka.consumer({ groupId: 'user-register-migration-group' });
+const userRegisterConsumer = kafka.consumer({ groupId: 'migration_user_register_group' });
 
 // User Booking
-const userBookingConsumer = kafka.consumer({ groupId: 'user-booking-migration-group' });
+const userBookingConsumer = kafka.consumer({ groupId: 'migration_user_booking_group' });
 
 // B2B Booking
-const b2bBookingConsumer = kafka.consumer({ groupId: 'b2b-booking-migration-group' });
+const b2bBookingConsumer = kafka.consumer({ groupId: 'migration_b2b_booking_group' });
 
 // Feedback Track / Service Buddy
-const feedbackConsumer = kafka.consumer({ groupId: 'feedback-track-migration-group' });
+const feedbackConsumer = kafka.consumer({ groupId: 'migration_feedback_track_group' });
 
 // Admin Comments
-const adminCommentsConsumer = kafka.consumer({ groupId: 'admin-comments-migration-group' });
+const adminCommentsConsumer = kafka.consumer({ groupId: 'migration_admin_comments_group' });
 
 // user reg
-const uservechicleConsumer =  kafka.consumer({ groupId: 'user-vechile-migration-group'});
+const uservechicleConsumer =  kafka.consumer({ groupId: 'migration_user_vechile_group'});
 
 
 
