@@ -1,17 +1,47 @@
-const { Kafka, logLevel } = require("kafkajs");
+// config/kafka_config.js
+const { Kafka, Partitioners } = require('kafkajs');
 
 const kafka = new Kafka({
-  clientId: process.env.KAFKA_CLIENT_ID,
-  brokers: process.env.KAFKA_BROKERS.split(","),
-  ssl: process.env.KAFKA_SSL === "true",
-  sasl: process.env.KAFKA_SASL_MECHANISM
-    ? {
-        mechanism: process.env.KAFKA_SASL_MECHANISM,
-        username: process.env.KAFKA_SASL_USERNAME,
-        password: process.env.KAFKA_SASL_PASSWORD
-      }
-    : undefined,
-  logLevel: logLevel.ERROR
+  clientId: 'bridge-migration',
+  brokers: ['localhost:9092'],
 });
 
-module.exports = kafka;
+const producer = kafka.producer({
+  createPartitioner: Partitioners.LegacyPartitioner,
+});
+
+// User Register
+const userRegisterConsumer = kafka.consumer({ groupId: 'user-register-migration-group' });
+
+// User Booking
+const userBookingConsumer = kafka.consumer({ groupId: 'user-booking-migration-group' });
+
+// B2B Booking
+const b2bBookingConsumer = kafka.consumer({ groupId: 'b2b-booking-migration-group' });
+
+// Feedback Track / Service Buddy
+const feedbackConsumer = kafka.consumer({ groupId: 'feedback-track-migration-group' });
+
+// Admin Comments
+const adminCommentsConsumer = kafka.consumer({ groupId: 'admin-comments-migration-group' });
+
+// user reg
+const uservechicleConsumer =  kafka.consumer({ groupId: 'user-vechile-migration-group'});
+
+
+
+
+module.exports = {
+  kafka,     // optional, for admin/debug
+  producer,
+  userRegisterConsumer,
+  userBookingConsumer,
+  b2bBookingConsumer,
+  feedbackConsumer,
+  adminCommentsConsumer,
+  uservechicleConsumer
+
+
+
+};
+  

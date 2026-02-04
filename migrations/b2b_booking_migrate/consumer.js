@@ -1,68 +1,134 @@
 /**
- * b2b_booking_tbl - Kafka Producer
- * Dual-schema migration safe
+ * b2b_booking_bridge - Kafka Consumer
+ * Fully uniform with user_register consumer
  */
 
-const axios = require("axios");
-const kafka = require("../common/kafka");
-const { CompressionTypes } = require("kafkajs");
+const { b2bBookingConsumer } = require('../../config/kafka_config');
+const { liveDB, uatDB } = require('../../config/revamp_db');
 
-const producer = kafka.producer({
-  idempotent: true,
-  maxInFlightRequests: 5,
-  allowAutoTopicCreation: false
-});
+console.log('🚀 B2B Booking Consumer started');
 
-const delay = ms => new Promise(res => setTimeout(res, ms));
+/* ---------- Constants ---------- */
+const SOURCE_TABLE = 'b2b_booking_work';
+const TARGET_TABLE = [
+  'UAT_mytvs_bridge.b2b_booking_tbl_uat',
+  'mytvs_bridge.b2b_booking_tbl'
+];
+const MIGRATION_STEP = 'b2b_booking_bridge_migration';
+const TOPIC = 'b2b_booking_bridge_migration';
+const MIN_DATE = new Date('2023-12-31T23:59:59Z');
 
-const API_BATCH = 10000;       // API fetch batch
-const KAFKA_BATCH = 1000;      // Kafka send batch
-const TOPIC = "b2b_booking_bridge_migration";
-const TABLE = "b2b.b2b_booking_tbl";
-
-(async () => {
+/* ---------- Safe Error Logger ---------- */
+async function logError(data, msg, table = TARGET_TABLE.join(',')) {
   try {
-    await producer.connect();
-    console.log("✅ Kafka producer connected for b2b_booking_tbl");
+    if (!uatDB) return;
 
-    let offset = 0;
-    while (true) {
-      // Fetch from API
-      const res = await axios.get(
-        `https://bridge.gobumpr.com/api/csv/get_csv.php`,
-        { params: { table: TABLE, limit: API_BATCH, offset }, timeout: 30000 }
-      );
+    const jsonData = (() => {
+      try { return JSON.stringify(data || {}); }
+      catch { return '{}'; }
+    })();
 
-      const data = res.data;
-      if (!data || !data.length) break;
+    await uatDB.query(
+      `INSERT INTO migration_error_log
+       (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        SOURCE_TABLE,
+        table,
+        data?.b2b_booking_id || null,
+        jsonData,
+        msg,
+        MIGRATION_STEP
+      ]
+    );
+  } catch (err) {
+    console.error('❌ Migration error log failed:', err.message || err);
+  }
+}
 
-      // Convert rows to Kafka messages
-      const messages = data.map(row => ({
-        key: String(row.booking_id),
-        value: JSON.stringify(row)
-      }));
+/* ---------- Consumer ---------- */
+async function runB2BBookingConsumer() {
+  await b2bBookingConsumer.connect();
+  await b2bBookingConsumer.subscribe({ topic: TOPIC, fromBeginning: true });
 
-      // Split into Kafka-safe chunks
-      for (let i = 0; i < messages.length; i += KAFKA_BATCH) {
-        await producer.send({
-          topic: TOPIC,
-          compression: CompressionTypes.Snappy,
-          messages: messages.slice(i, i + KAFKA_BATCH)
-        });
+  console.log('✅ B2B Booking Consumer running');
+
+  await b2bBookingConsumer.run({
+    eachBatchAutoResolve: false,
+
+    eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
+      for (const message of batch.messages) {
+        let data;
+
+        /* ---------- JSON Parse ---------- */
+        try {
+          data = JSON.parse(message.value.toString());
+        } catch {
+          await logError({}, 'INVALID_JSON');
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        // Skip rows before MIN_DATE
+        if (!data.b2b_log || new Date(data.b2b_log) <= MIN_DATE) {
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        try {
+          for (const table of TARGET_TABLE) {
+            const insertSQL = `
+              INSERT INTO ${table}
+              (b2b_booking_id, booking_id, pickup_date, pickup_time, tvs_job_card_no, goaxled_log_date, migrated_data)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                b2b_booking_id = VALUES(b2b_booking_id),
+                booking_id = VALUES(booking_id),
+                pickup_date = VALUES(pickup_date),
+                pickup_time = VALUES(pickup_time),
+                tvs_job_card_no = VALUES(tvs_job_card_no),
+                goaxled_log_date = VALUES(goaxled_log_date),
+                migrated_data = VALUES(migrated_data)
+            `;
+
+            const params = [
+              data.b2b_booking_id,
+              data.gb_booking_id,
+              data.pickup_date || null,
+              data.pickup_time || null,
+              data.tvs_job_card_no || null,
+              data.goaxled_log_date || null,
+              data.jsonData
+            ];
+
+            try {
+              await Promise.all([
+                liveDB.query(insertSQL, params),
+                uatDB.query(insertSQL, params)
+              ]);
+            } catch (err) {
+              await logError(data, 'UPSERT_FAILED: ' + (err.message || err), table);
+            }
+          }
+
+          resolveOffset(message.offset);
+          await heartbeat();
+
+        } catch (err) {
+          await logError(data, 'PROCESSING_FAILED: ' + (err.message || err));
+          resolveOffset(message.offset);
+        }
       }
 
-      console.log(`📦 Sent ${messages.length} rows (offset ${offset})`);
-
-      offset += API_BATCH;
-      await delay(100); // small throttle
+      await commitOffsetsIfNecessary();
     }
+  });
+}
 
-    console.log("🎉 Migration completed for b2b_booking_tbl");
+/* ---------- Bootstrap ---------- */
+runB2BBookingConsumer().catch(err => {
+  console.error('❌ B2B Booking Consumer fatal:', err);
+  process.exit(1);
+});
 
-  } catch (err) {
-    console.error("❌ Producer fatal:", err);
-  } finally {
-    await producer.disconnect();
-    console.log("🔌 Kafka producer disconnected");
-  }
-})();
+module.exports = runB2BBookingConsumer;

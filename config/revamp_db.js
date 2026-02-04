@@ -1,15 +1,35 @@
-const mysql = require("mysql2/promise");
+/**
+ * revamp_db.js
+ * MySQL pool for Live & UAT (SSL required)
+ */
 
+
+const path = require('path');
+require('dotenv').config({
+  path: path.resolve(__dirname, '../.env') // ← correct
+});
+
+const mysql = require('mysql2/promise');
+
+// ---------- Base config (COMMON) ----------
 const baseConfig = {
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  waitForConnections: process.env.DB_WAIT_FOR_CONNECTIONS === "true",
-  connectionLimit: Number(process.env.DB_CONNECTION_LIMIT),
-  queueLimit: Number(process.env.DB_QUEUE_LIMIT)
+  host: process.env.OLD_DB_HOST,
+  user: process.env.OLD_DB_USER,
+  password: process.env.OLD_DB_PASSWORD,
+  port: Number(process.env.OLD_DB_PORT),
+
+  // 🔑 THIS IS THE FIX
+  ssl: { rejectUnauthorized: false },
+
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
 };
 
+// ---------- Debug ----------
+
+
+// ---------- Pools ----------
 const liveDB = mysql.createPool({
   ...baseConfig,
   database: process.env.DB_SCHEMA_LIVE
@@ -20,7 +40,5 @@ const uatDB = mysql.createPool({
   database: process.env.DB_SCHEMA_UAT
 });
 
-module.exports = {
-  liveDB,
-  uatDB
-};
+
+module.exports = { liveDB, uatDB };

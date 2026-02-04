@@ -1,18 +1,15 @@
 /**
  * feedback_track - Kafka Producer
- * Safe for large CSV/API migrations
+ * IDENTICAL logic to user_register producer
  */
 
 const axios = require('axios');
-const kafka = require('../common/kafka');
+const { producer } = require('../../config/kafka_config');
 
-// ⚙️ Kafka producer
-const producer = kafka.producer();
-
-// ⏳ Utility delay
+// Utility delay
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// 📦 Chunk array into smaller Kafka-safe batches
+// Chunk array into smaller Kafka-safe batches
 function chunkArray(arr, size) {
   const chunks = [];
   for (let i = 0; i < arr.length; i += size) {
@@ -21,9 +18,9 @@ function chunkArray(arr, size) {
   return chunks;
 }
 
-(async () => {
-  const API_BATCH_SIZE = 10000; // API fetch size
-  const KAFKA_BATCH_SIZE = 200; // Kafka safe batch
+async function runFeedbackTrackProducer() {
+  const API_BATCH_SIZE = 10000;
+  const KAFKA_BATCH_SIZE = 200;
   const TOPIC = 'feedback_track_migration';
   const TABLE = 'feedback_track';
 
@@ -32,57 +29,78 @@ function chunkArray(arr, size) {
 
   try {
     await producer.connect();
-    console.log(`[${new Date().toISOString()}] ✅ Kafka producer connected.`);
+    console.log('✅ Feedback Track Producer connected');
 
     while (true) {
-      console.log(`[${new Date().toISOString()}] ⏳ Fetching from API: offset=${offset}, limit=${API_BATCH_SIZE}`);
-
       const res = await axios.get(
-        `https://bridge.gobumpr.com/api/csv/get_csv.php`,
+        'https://bridge.gobumpr.com/api/csv/get_csv.php',
         {
           params: { table: TABLE, limit: API_BATCH_SIZE, offset },
-          timeout: 30000
+          timeout: 30000,
         }
       );
 
       const data = res.data;
-      if (!data || !Array.isArray(data) || data.length === 0) {
-        console.log(`[${new Date().toISOString()}] ✅ No more data to process.`);
+
+      if (!Array.isArray(data) || data.length === 0) {
+        console.log('✅ No more feedback_track records');
         break;
       }
 
-      // 🔁 Convert rows to Kafka messages
-      const messages = data.map(row => ({
-        key: row.id ? String(row.id) : undefined,
-        value: JSON.stringify(row)
-      }));
+      const messages = data
+        .filter(row => row)
+        .map(row => {
+          let key = row.id;
 
-      // 🔪 Split into Kafka-safe chunks
+          // SAME robust key logic as user_register
+          if (!key || typeof key !== 'number' || key <= 0) {
+            key = `temp_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
+          }
+
+          return {
+            key: String(key),
+            value: JSON.stringify(row),
+          };
+        });
+
       const kafkaChunks = chunkArray(messages, KAFKA_BATCH_SIZE);
 
       for (const chunk of kafkaChunks) {
-        await producer.send({
-          topic: TOPIC,
-          messages: chunk
-        });
-        totalSent += chunk.length;
+        try {
+          await producer.send({
+            topic: TOPIC,
+            messages: chunk,
+          });
+          totalSent += chunk.length;
+        } catch (err) {
+          console.error('❌ Kafka send failed for a batch:', err);
+        }
       }
 
-      console.log(`[${new Date().toISOString()}] 📦 Sent ${messages.length} rows (Total sent: ${totalSent})`);
+      console.log(`📦 Sent ${messages.length} messages (Total ${totalSent})`);
 
       offset += API_BATCH_SIZE;
-      await delay(100); // small throttle
+      await delay(100);
     }
 
-    console.log(`[${new Date().toISOString()}] 🎉 Migration completed. Total records sent: ${totalSent}`);
   } catch (err) {
-    console.error(`[${new Date().toISOString()}] ❌ Producer fatal error:`, err);
+    console.error('❌ Feedback Track Producer error:', err);
   } finally {
     try {
       await producer.disconnect();
-      console.log(`[${new Date().toISOString()}] 🔌 Kafka producer disconnected.`);
-    } catch (e) {
-      console.error('❌ Error disconnecting producer:', e);
+      console.log('🔌 Feedback Track Producer disconnected');
+    } catch (err) {
+      console.error('❌ Error disconnecting producer:', err);
     }
   }
-})();
+}
+
+// Run directly if executed
+if (require.main === module) {
+  runFeedbackTrackProducer().catch(err => {
+    console.error('❌ Fatal Producer Error:', err);
+    process.exit(1);
+  });
+}
+
+module.exports = runFeedbackTrackProducer;

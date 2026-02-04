@@ -1,141 +1,127 @@
+/**
+ * feedback_track_bridge - Kafka Consumer (Safe & Unified Version)
+ */
 
-const axios = require("axios");
+const { feedbackConsumer } = require('../../config/kafka_config');
+const { liveDB, uatDB } = require('../../config/revamp_db');
+const { encrypt } = require('../../common/encryption');
 
-const kafka = require('../../config/kafka_config');
-const db = require('../../config/revamp_db');
-const { encrypt } = require("../common/encryption");
+console.log("🚀 Feedback Track Consumer script started");
 
-/* =========================
-   CONSUMER CONFIG
-========================= */
-const consumer = kafka.consumer({
-  groupId: "feedback-track-bridge-migration-v2",
-  sessionTimeout: 60000,
-  heartbeatInterval: 3000
-});
-
-const MIGRATION_STEP = "feedback_track_bridge_migration";
-
-// Dual-schema target tables
-const TARGET_TABLES = [
-  "UAT_mytvs_bridge.feedback_track",
+/* ---------- Constants ---------- */
+const SOURCE_TABLE = 'feedback_track';
+const TARGET_TABLE = [
+  "UAT_mytvs_bridge.service_buddy_booking_uat",
   "mytvs_bridge.feedback_track"
 ];
+const MIGRATION_STEP = 'feedback_track_bridge_migration';
+const MIN_DATE = new Date('2023-12-31T23:59:59Z');
 
-const SOURCE_TABLE = "feedback_track";
-const DB_BATCH_SIZE = 500; // Optional batching if needed
-
-/* ---------- Error Logger ---------- */
-async function logError(data, msg) {
+/* ---------- Safe Encryption ---------- */
+function safeEncrypt(input) {
+  if (!input) return null;
   try {
-    await mysql.query(
-      `
-      INSERT INTO migration_error_log
-      (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      [
-        SOURCE_TABLE,
-        TARGET_TABLES.join(","),
-        data?.id || null,
-        JSON.stringify(data || {}),
-        msg,
-        MIGRATION_STEP
-      ]
-    );
-  } catch (_) {}
+    return encrypt(input);
+  } catch (err) {
+    console.error('❌ Encryption failed for:', input, err.message);
+    return null;
+  }
 }
 
-/* =========================
-   CONSUMER RUN
-========================= */
-async function run() {
-  await consumer.connect();
-  await consumer.subscribe({ topic: "service_buddy_booking_migration", fromBeginning: true });
+/* ---------- Safe Error Logger ---------- */
+async function logError(data, msg, table = TARGET_TABLE.join(',')) {
+  try {
+    if (!uatDB) return;
+    const jsonData = (() => { try { return JSON.stringify(data || {}); } catch { return '{}'; } })();
 
-  console.log("✅ Feedback Track Dual-Schema Consumer Started");
+    await uatDB.query(
+      `INSERT INTO migration_error_log
+       (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [SOURCE_TABLE, table, data?.id || null, jsonData, msg, MIGRATION_STEP]
+    );
+  } catch (err) {
+    console.error('❌ Migration error log failed:', err.message || err);
+  }
+}
 
-  await consumer.run({
-    autoCommit: false,
-    eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary, isRunning, isStale }) => {
-      const rows = [];
+/* ---------- Consumer ---------- */
+async function runFeedbackTrackConsumer() {
+  await feedbackConsumer.connect();
+  await feedbackConsumer.subscribe({ topic: 'feedback_track_migration', fromBeginning: true });
+  console.log('✅ Feedback Track Consumer Started');
+
+  await feedbackConsumer.run({
+    eachBatchAutoResolve: false,
+    eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
 
       for (const message of batch.messages) {
-        if (!isRunning() || isStale()) break;
-
         let data;
         try {
           data = JSON.parse(message.value.toString());
         } catch {
-          await logError({}, "INVALID_JSON");
+          await logError({}, 'INVALID_JSON');
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        // Skip rows before MIN_DATE
+        if (!data.created_log || new Date(data.created_log) <= MIN_DATE) {
           resolveOffset(message.offset);
           continue;
         }
 
         try {
-          // Optional: encrypt or normalize fields if needed
-          const crmLogId = data.crm_update_id ? encrypt(String(data.crm_update_id)) : null;
+          const crmLogId = safeEncrypt(data.crm_update_id ? String(data.crm_update_id) : null);
 
-          rows.push([
-            data.id,
-            data.booking_id,
-            data.b2b_booking_id,
-            crmLogId,
-            data.created_log
-          ]);
+          for (const table of TARGET_TABLE) {
+            const insertSQL = `
+              INSERT INTO ${table}
+              (id, booking_id, b2b_booking_id, crm_update_id, created_log)
+              VALUES (?, ?, ?, ?, ?)
+              ON DUPLICATE KEY UPDATE
+                booking_id = VALUES(booking_id),
+                b2b_booking_id = VALUES(b2b_booking_id),
+                crm_log_id = VALUES(crm_update_id),
+                created_log = VALUES(created_log)
+            `;
+
+            const params = [
+              data.id,
+              data.booking_id,
+              data.b2b_booking_id,
+              crmLogId,
+              data.created_log || null
+            ];
+
+            try {
+              await Promise.all([
+                liveDB.query(insertSQL, params),
+                uatDB.query(insertSQL, params)
+              ]);
+            } catch (err) {
+              await logError(data, 'INSERT_FAILED: ' + (err.message || err), table);
+            }
+          }
+
+          resolveOffset(message.offset);
+          await heartbeat();
 
         } catch (err) {
-          await logError(data, err.message);
+          await logError(data, 'PROCESSING_FAILED: ' + (err.message || err));
           resolveOffset(message.offset);
         }
-
-        resolveOffset(message.offset);
       }
 
-      if (!rows.length) return;
-
-      // Insert / update in both schemas
-      const SQL = `
-        INSERT INTO ?? 
-        (id, booking_id, b2b_booking_id, crm_log_id, created_log)
-        VALUES ?
-        ON DUPLICATE KEY UPDATE
-          booking_id = VALUES(booking_id),
-          b2b_booking_id = VALUES(b2b_booking_id),
-          crm_log_id = VALUES(crm_log_id),
-          created_log = VALUES(created_log)
-      `;
-
-      try {
-        for (const table of TARGET_TABLES) {
-          for (let i = 0; i < rows.length; i += DB_BATCH_SIZE) {
-            await mysql.query(SQL, [table, rows.slice(i, i + DB_BATCH_SIZE)]);
-            await heartbeat();
-          }
-        }
-
-        await commitOffsetsIfNecessary();
-      } catch (err) {
-        console.error("❌ DB batch failed:", err.message);
-      }
+      await commitOffsetsIfNecessary();
     }
   });
 }
 
-/* ---------- Graceful Shutdown ---------- */
-async function shutdown(signal) {
-  console.log(`⚠️ Consumer shutdown: ${signal}`);
-  try {
-    await consumer.disconnect();
-  } finally {
-    process.exit(0);
-  }
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-run().catch(err => {
-  console.error("❌ Consumer fatal:", err);
+/* ---------- Run Consumer ---------- */
+runFeedbackTrackConsumer().catch(err => {
+  console.error("❌ Consumer failed:", err);
   process.exit(1);
 });
+
+module.exports = runFeedbackTrackConsumer;

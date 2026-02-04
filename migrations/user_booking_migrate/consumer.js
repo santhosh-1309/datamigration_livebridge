@@ -1,68 +1,65 @@
-const kafka = require('../../config/kafka_config');
-const mysql = require('../../config/revamp_db');
+/**
+ * user_booking_bridge - Kafka Consumer
+ * Fully unified with other migration consumers
+ */
+
+const { userBookingConsumer } = require('../../config/kafka_config');
+const { liveDB, uatDB } = require('../../config/revamp_db');
+
+console.log('🚀 User Booking Consumer started');
 
 /* ===============================
-   CONFIG
+   CONSTANTS
 ================================ */
-const TOPIC = 'user_booking_tb_migration';
-const GROUP_ID = 'user-booking-bridge-migration';
+const SOURCE_TABLE = 'user_booking_tb';
 const TARGET_TABLE = [
-  "UAT_mytvs_bridge.user_booking_tb",
-  "mytvs_bridge.user_booking_tb"
+  '`UAT_mytvs_bridge`.`user_booking_uat`',
+  '`mytvs_bridge`.`user_booking`'
 ];
+
+const TOPIC = 'user_booking_tb_migration';
 const MIGRATION_STEP = 'user_booking_bridge_migration';
-
-// ⏱ Same date filter (NO logic change)
 const MIN_DATE = new Date('2024-01-01T00:00:00Z');
-
-// Batch insert size
 const DB_BATCH_SIZE = 500;
 
 /* ===============================
-   KAFKA CONSUMER
+   ERROR LOGGER
 ================================ */
-const consumer = kafka.consumer({
-  groupId: GROUP_ID,
-  sessionTimeout: 30000,
-  maxBytesPerPartition: 10 * 1024 * 1024
-});
-
-/* ===============================
-   ERROR LOGGER (NON-BLOCKING)
-================================ */
-async function logError(data, errorMsg) {
+async function logError(data, msg, table = TARGET_TABLE.join(',')) {
   try {
-    await mysql.query(
+    if (!uatDB) return;
+
+    await uatDB.query(
       `
       INSERT INTO migration_error_log
       (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
       VALUES (?, ?, ?, ?, ?, ?)
       `,
       [
-        'user_booking_tb',
-        TARGET_TABLE,
+        SOURCE_TABLE,
+        table,
         data?.booking_id || null,
         JSON.stringify(data || {}),
-        errorMsg,
+        msg,
         MIGRATION_STEP
       ]
     );
   } catch (_) {
-    // never block consumer
+    // silent
   }
 }
 
 /* ===============================
    CONSUMER RUN
 ================================ */
-async function run() {
-  await consumer.connect();
-  await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
+async function runUserBookingConsumer() {
+  await userBookingConsumer.connect();
+  await userBookingConsumer.subscribe({ topic: TOPIC, fromBeginning: true });
 
-  console.log('🚀 User Booking consumer running');
+  console.log('✅ User Booking Consumer running');
 
-  await consumer.run({
-    autoCommit: false,
+  await userBookingConsumer.run({
+    eachBatchAutoResolve: false,
 
     eachBatch: async ({
       batch,
@@ -70,6 +67,7 @@ async function run() {
       heartbeat,
       commitOffsetsIfNecessary
     }) => {
+
       const rows = [];
 
       for (const message of batch.messages) {
@@ -83,13 +81,13 @@ async function run() {
           continue;
         }
 
-        try {
-          // ⛔ SAME filter logic
-          if (!data.created_log || new Date(data.created_log) < MIN_DATE) {
-            resolveOffset(message.offset);
-            continue;
-          }
+        // Skip old data
+        if (!data.created_log || new Date(data.created_log) < MIN_DATE) {
+          resolveOffset(message.offset);
+          continue;
+        }
 
+        try {
           rows.push([
             data.booking_id,
             data.reg_id,
@@ -101,10 +99,8 @@ async function run() {
             data.source || null,
             data.crm_update_id || null,
             data.city_id || null,
-            data.city || null,
-            data.log || new Date()
+            data.city || null
           ]);
-
         } catch (err) {
           await logError(data, err.message);
         }
@@ -112,60 +108,67 @@ async function run() {
         resolveOffset(message.offset);
       }
 
-      if (!rows.length) return;
-
-      const SQL = `
-        INSERT INTO ${TARGET_TABLE}
-        (
-          booking_id,
-          reg_id,
-          garage_code,
-          user_veh_id,
-          service_type,
-          created_log,
-          booking_status,
-          source,
-          crm_update_id,
-          city_id,
-          city,
-          created_log
-        )
-        VALUES ?
-        ON DUPLICATE KEY UPDATE
-          reg_id = VALUES(reg_id),
-          garage_code = VALUES(garage_code),
-          user_veh_id = VALUES(user_veh_id),
-          service_type = VALUES(service_type),
-          booking_status = VALUES(booking_status),
-          source = VALUES(source),
-          crm_update_id = VALUES(crm_update_id),
-          city_id = VALUES(city_id),
-          city = VALUES(city),
-          created_log = VALUES(created_log)
-      `;
-
-      try {
-        for (let i = 0; i < rows.length; i += DB_BATCH_SIZE) {
-          await mysql.query(SQL, [rows.slice(i, i + DB_BATCH_SIZE)]);
-          await heartbeat();
-        }
-
+      if (!rows.length) {
         await commitOffsetsIfNecessary();
-      } catch (err) {
-        console.error('❌ DB batch failed:', err.message);
-        throw err; // DO NOT COMMIT OFFSETS
+        return;
       }
+
+      for (const table of TARGET_TABLE) {
+        const SQL = `
+          INSERT INTO ${table}
+          (
+            booking_id,
+            reg_id,
+            garage_code,
+            user_veh_id,
+            actual_service_type_migration,
+            created_log,
+            booking_status,
+            source,
+            crm_update_id,
+            city_id,
+            city
+          )
+          VALUES ?
+          ON DUPLICATE KEY UPDATE
+            reg_id = VALUES(reg_id),
+            garage_code = VALUES(garage_code),
+            user_veh_id = VALUES(user_veh_id),
+            actual_service_type_migration = VALUES(actual_service_type_migration),
+            booking_status = VALUES(booking_status),
+            source = VALUES(source),
+            crm_update_id = VALUES(crm_update_id),
+            city_id = VALUES(city_id),
+            city = VALUES(city)
+        `;
+
+        try {
+          for (let i = 0; i < rows.length; i += DB_BATCH_SIZE) {
+            await Promise.all([
+              liveDB.query(SQL, [rows.slice(i, i + DB_BATCH_SIZE)]),
+              uatDB.query(SQL, [rows.slice(i, i + DB_BATCH_SIZE)])
+            ]);
+            await heartbeat();
+          }
+        } catch (err) {
+          console.error(`❌ DB batch failed (${table}):`, err.message);
+          await logError({}, 'BATCH_INSERT_FAILED: ' + err.message, table);
+          throw err; // offsets NOT committed
+        }
+      }
+
+      await commitOffsetsIfNecessary();
     }
   });
 }
 
 /* ===============================
-   GRACEFUL SHUTDOWN
+   SHUTDOWN
 ================================ */
 async function shutdown(signal) {
   console.log(`⚠️ User Booking consumer shutdown: ${signal}`);
   try {
-    await consumer.disconnect();
+    await userBookingConsumer.disconnect();
   } finally {
     process.exit(0);
   }
@@ -174,7 +177,12 @@ async function shutdown(signal) {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-run().catch(err => {
+/* ===============================
+   BOOTSTRAP
+================================ */
+runUserBookingConsumer().catch(err => {
   console.error('❌ User Booking consumer fatal:', err);
   process.exit(1);
 });
+
+module.exports = runUserBookingConsumer;

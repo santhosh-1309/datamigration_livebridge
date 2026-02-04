@@ -1,189 +1,110 @@
-const kafka = require("../common/kafka");
-const mysql = require("../config/newDB");
+/**
+ * admin_comments_bridge - Kafka Producer
+ * Aligned with user_register producer (production safe)
+ */
 
-const consumer = kafka.consumer({
-  groupId: "admin-comments-bridge-migration",
-  sessionTimeout: 60000,
-  heartbeatInterval: 3000,
-  maxBytesPerPartition: 10 * 1024 * 1024
-});
+const axios = require('axios');
+const { producer } = require('../../config/kafka_config');
 
-/* =========================
-   CONFIG
-========================= */
-const TOPIC = "admin_comments_migration";
-const SOURCE_TABLE = "admin_comments_tbl";
-const TARGET_TABLE = [
-  "UAT_mytvs_bridge.admin_comments_stage",
-  "mytvs_bridge.admin_comments_stage"
-];
-const MIGRATION_STEP = "admin_comments_migration";
-const COMMENT_MAX_BYTES = 255;
+// Utility delay
+const delay = ms => new Promise(res => setTimeout(res, ms));
 
-// ✅ DATE FILTER BASED ON user_booking_tb.log
-const MIN_DATE = new Date("2024-01-01T00:00:00Z");
-
-/* =========================
-   HELPERS
-========================= */
-function safeTruncateUtf8(str, maxBytes) {
-  if (!str) return null;
-  const buf = Buffer.from(str, "utf8");
-  return buf.length <= maxBytes
-    ? str
-    : buf.slice(0, maxBytes).toString("utf8");
+// Chunk array into Kafka-safe batches
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
 }
 
-/* =========================
-   ERROR LOGGER (NON-BLOCKING)
-========================= */
-async function logError(data, msg) {
+async function runAdminCommentsProducer() {
+  const API_BATCH_SIZE = 10000;     // fetch 10k rows at a time
+  const KAFKA_BATCH_SIZE = 200;     // send 200 msgs per Kafka batch
+  const TOPIC = 'admin_comments_migration';
+  const TABLE = 'admin_comments_tbl';
+
+  let offset = 0;
+  let totalSent = 0;
+
   try {
-    await mysql.query(
-      `
-      INSERT INTO migration_error_log
-      (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
-      [
-        SOURCE_TABLE,
-        TARGET_TABLE,
-        data?.com_id || null,
-        JSON.stringify(data || {}),
-        msg,
-        MIGRATION_STEP
-      ]
-    );
-  } catch (_) {
-    // never block consumer
+    await producer.connect();
+    console.log('✅ Admin Comments Producer connected');
+
+    while (true) {
+      const res = await axios.get(
+        'https://bridge.gobumpr.com/api/csv/get_csv.php',
+        {
+          params: {
+            table: TABLE,
+            limit: API_BATCH_SIZE,
+            offset
+          },
+          timeout: 30000
+        }
+      );
+
+      const data = res.data;
+
+      if (!Array.isArray(data) || data.length === 0) {
+        console.log('✅ No more admin_comments records');
+        break;
+      }
+
+      // Build Kafka messages (robust key handling)
+      const messages = data
+        .filter(row => row)
+        .map(row => {
+          let key = row.com_id;
+
+          // Kafka key must always be valid
+          if (!key || typeof key !== 'number' || key <= 0) {
+            key = `temp_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+          }
+
+          return {
+            key: String(key),
+            value: JSON.stringify(row)
+          };
+        });
+
+      const kafkaChunks = chunkArray(messages, KAFKA_BATCH_SIZE);
+
+      for (const chunk of kafkaChunks) {
+        try {
+          await producer.send({
+            topic: TOPIC,
+            messages: chunk
+          });
+          totalSent += chunk.length;
+        } catch (err) {
+          console.error('❌ Kafka send failed for a batch:', err.message);
+        }
+      }
+
+      console.log(`📦 Sent ${messages.length} messages (Total ${totalSent})`);
+      offset += API_BATCH_SIZE;
+      await delay(100);
+    }
+
+  } catch (err) {
+    console.error('❌ Admin Comments Producer error:', err.message);
+  } finally {
+    try {
+      await producer.disconnect();
+      console.log('🔌 Admin Comments Producer disconnected');
+    } catch (err) {
+      console.error('❌ Error disconnecting producer:', err.message);
+    }
   }
 }
 
-/* =========================
-   CONSUMER
-========================= */
-async function run() {
-  await consumer.connect();
-  await consumer.subscribe({ topic: TOPIC, fromBeginning: true });
-
-  console.log("🚀 Admin comments consumer running");
-
-  await consumer.run({
-    autoCommit: false,
-
-    eachBatch: async ({
-      batch,
-      resolveOffset,
-      heartbeat,
-      commitOffsetsIfNecessary,
-      isRunning,
-      isStale
-    }) => {
-      for (const message of batch.messages) {
-        if (!isRunning() || isStale()) break;
-
-        let r;
-
-        try {
-          r = JSON.parse(message.value.toString());
-
-          if (!r.book_id) {
-            resolveOffset(message.offset);
-            continue;
-          }
-
-          /* =========================
-             FETCH BOOKING (SOURCE OF TRUTH)
-          ========================= */
-          const [[booking]] = await mysql.query(
-            `
-            SELECT booking_id, log
-            FROM user_booking_tb
-            WHERE booking_id = ?
-            LIMIT 1
-            `,
-            [r.book_id]
-          );
-
-          // ❌ Booking does not exist
-          if (!booking) {
-            resolveOffset(message.offset);
-            continue;
-          }
-
-          // ❌ Booking older than MIN_DATE
-          if (new Date(booking.log) < MIN_DATE) {
-            resolveOffset(message.offset);
-            continue;
-          }
-
-          /* =========================
-             INSERT / UPDATE COMMENT
-          ========================= */
-          const comment = safeTruncateUtf8(
-            r.comments?.toString().trim(),
-            COMMENT_MAX_BYTES
-          );
-
-          await mysql.query(
-            `
-            INSERT INTO admin_comments_stage
-            (
-              id,
-              booking_id,
-              comment,
-              followup_date,
-              booking_status,
-              created_log,
-              mod_log
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-              comment = VALUES(comment),
-              followup_date = VALUES(followup_date),
-              booking_status = VALUES(booking_status),
-              mod_log = VALUES(mod_log)
-            `,
-            [
-              r.com_id,
-              booking.booking_id,
-              comment,
-              r.Follow_up_date || null,
-              r.booking_status || null,
-              r.comment_log || null,
-              r.update_log || null
-            ]
-          );
-
-        } catch (err) {
-          await logError(r, err.message);
-        }
-
-        resolveOffset(message.offset);
-        await heartbeat();
-      }
-
-      await commitOffsetsIfNecessary();
-    }
+// Run directly
+if (require.main === module) {
+  runAdminCommentsProducer().catch(err => {
+    console.error('❌ Fatal Producer Error:', err);
+    process.exit(1);
   });
 }
 
-/* =========================
-   GRACEFUL SHUTDOWN
-========================= */
-async function shutdown(signal) {
-  console.log(`⚠️ Admin comments consumer shutdown: ${signal}`);
-  try {
-    await consumer.disconnect();
-  } finally {
-    process.exit(0);
-  }
-}
-
-process.on("SIGINT", shutdown);
-process.on("SIGTERM", shutdown);
-
-run().catch(err => {
-  console.error("❌ Admin comments consumer fatal:", err);
-  process.exit(1);
-});
+module.exports = runAdminCommentsProducer;

@@ -1,0 +1,39 @@
+{
+  "mode": "cycle",
+  "cycleDelayMs": 60000,
+  "kafkaDrainWaitMs": 30000,
+
+  "steps": [
+    {
+       "name": "user_register",
+      "path": "user_register_migrate",
+      "consumer": "consumer.js",
+      "producer": "producer.js"
+    },
+    {
+      "name": "user_vehicle",
+      "producer": "producer.js",
+      "consumer": "consumer.js"
+    },
+    {
+      "name": "user_booking",
+      "producer": "producer.js",
+      "consumer": "consumer.js"
+    },
+    {
+      "name": "admin_comments",
+      "producer": "producer.js",
+      "consumer": "consumer.js"
+    },
+    {
+      "name": "b2b_booking",
+      "producer": "producer.js",
+      "consumer": "consumer.js"
+    },
+    {
+      "name": "feedback_track",
+      "producer": "producer.js",
+      "consumer": "consumer.js"
+    }
+  ]
+}
