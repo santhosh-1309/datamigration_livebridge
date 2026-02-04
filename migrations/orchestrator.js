@@ -20,7 +20,7 @@ function resolvePath(p) {
 }
 
 // --------------------
-// Run node script
+// Run node script (blocking)
 // --------------------
 function runProcess(script, label, cwd = "") {
   return new Promise((resolve, reject) => {
@@ -34,7 +34,7 @@ function runProcess(script, label, cwd = "") {
 
     const proc = spawn("node", [fullPath], {
       stdio: "inherit",
-      shell: true
+      shell: true,
     });
 
     proc.on("exit", (code) => {
@@ -42,6 +42,24 @@ function runProcess(script, label, cwd = "") {
       else reject(new Error(`${label} failed (${code})`));
     });
   });
+}
+
+// --------------------
+// Start consumer in background (PM2)
+// --------------------
+function startBackgroundProcess(script, name, cwd = "") {
+  const fullPath = resolvePath(path.join(cwd, script));
+
+  if (!fs.existsSync(fullPath)) {
+    throw new Error(`File not found: ${fullPath}`);
+  }
+
+  console.log(`▶ Starting background ${name}: ${fullPath}`);
+
+  execSync(
+    `pm2 start ${fullPath} --name ${name} --interpreter node`,
+    { stdio: "inherit" }
+  );
 }
 
 // --------------------
@@ -87,7 +105,7 @@ async function waitForKafkaLag(group) {
 }
 
 // --------------------
-// UPDATED runSingleCycle
+// Run single cycle
 // --------------------
 async function runSingleCycle(cycleNo) {
   console.log(`\n🔁 STARTING CYCLE #${cycleNo}`);
@@ -97,16 +115,24 @@ async function runSingleCycle(cycleNo) {
     const groupName = `migration_${step.name}_group`;
     const tableStart = Date.now();
 
-    // Start consumer
-    await runProcess(step.consumer, `Consumer ${step.name}`, step.path);
+    // 1️⃣ Start consumer in background
+    startBackgroundProcess(
+      step.consumer,
+      `consumer_${step.name}`,
+      step.path
+    );
 
-    // Start producer
-    await runProcess(step.producer, `Producer ${step.name}`, step.path);
+    // 2️⃣ Run producer (blocking)
+    await runProcess(
+      step.producer,
+      `Producer ${step.name}`,
+      step.path
+    );
 
-    // Wait for Kafka drain
+    // 3️⃣ Wait for Kafka drain
     await waitForKafkaLag(groupName);
 
-    // Stop consumer
+    // 4️⃣ Stop consumer
     try {
       execSync(`pm2 stop consumer_${step.name}`);
       execSync(`pm2 delete consumer_${step.name}`);
