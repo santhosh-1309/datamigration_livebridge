@@ -63,45 +63,71 @@ function startBackgroundProcess(script, name, cwd = "") {
 }
 
 // --------------------
-// Kafka lag helpers
+// Kafka status helper (FIXED)
 // --------------------
-function getKafkaLag(group) {
+function getKafkaStatus(group) {
   try {
     const output = execSync(
       `kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group ${group}`,
       { stdio: "pipe" }
     ).toString();
 
-    return output
-      .split("\n")
-      .slice(1)
-      .map((l) => l.trim().split(/\s+/)[6])
-      .filter(Boolean)
-      .reduce((a, b) => a + Number(b), 0);
+    const lines = output.split("\n").slice(1).filter(Boolean);
+
+    let totalLag = 0;
+    let totalLogEnd = 0;
+
+    for (const line of lines) {
+      const cols = line.trim().split(/\s+/);
+
+      const logEnd = cols[5] === "-" ? 0 : Number(cols[5]);
+      const lag = cols[6] === "-" ? 0 : Number(cols[6]);
+
+      totalLogEnd += logEnd;
+      totalLag += lag;
+    }
+
+    return { totalLag, totalLogEnd };
   } catch {
     return null;
   }
 }
 
+// --------------------
+// Wait for Kafka drain (SAFE)
+// --------------------
 async function waitForKafkaLag(group) {
-  console.log(`⏳ Waiting for Kafka lag = 0 | group: ${group}`);
+  console.log(`⏳ Waiting for Kafka drain | group: ${group}`);
   const start = Date.now();
 
   while (true) {
-    const lag = getKafkaLag(group);
+    const status = getKafkaStatus(group);
     const elapsed = Math.floor((Date.now() - start) / 1000);
 
-    if (lag !== null) {
-      console.log(`📉 Lag: ${lag} | ⏱ ${elapsed}s`);
-      if (lag === 0) break;
-    } else {
+    if (!status) {
       console.log(`⚠ Group not ready | ⏱ ${elapsed}s`);
+    } else {
+      const { totalLag, totalLogEnd } = status;
+
+      console.log(
+        `📊 logEnd=${totalLogEnd}, lag=${totalLag} | ⏱ ${elapsed}s`
+      );
+
+      // ✅ Either no data OR fully consumed
+      if (totalLogEnd === 0 || totalLag === 0) break;
+    }
+
+    // Optional safety timeout (6 hours)
+    if (elapsed > 6 * 60 * 60) {
+      throw new Error(`Kafka drain timeout for group ${group}`);
     }
 
     await sleep(60000);
   }
 
-  console.log(`✅ Kafka drained | ${Math.floor((Date.now() - start) / 1000)}s`);
+  console.log(
+    `✅ Kafka drained | ${Math.floor((Date.now() - start) / 1000)}s`
+  );
 }
 
 // --------------------
@@ -115,14 +141,14 @@ async function runSingleCycle(cycleNo) {
     const groupName = `migration_${step.name}_group`;
     const tableStart = Date.now();
 
-    // 1️⃣ Start consumer in background
+    // 1️⃣ Start consumer
     startBackgroundProcess(
       step.consumer,
       `consumer_${step.name}`,
       step.path
     );
 
-    // 2️⃣ Run producer (blocking)
+    // 2️⃣ Run producer
     await runProcess(
       step.producer,
       `Producer ${step.name}`,
