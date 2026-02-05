@@ -98,7 +98,7 @@ async function waitForKafkaLag(group) {
       console.log(`⚠ Group not ready | ⏱ ${elapsed}s`);
     }
 
-    await sleep(20000);
+    await sleep(60000);
   }
 
   console.log(`✅ Kafka drained | ${Math.floor((Date.now() - start) / 1000)}s`);
