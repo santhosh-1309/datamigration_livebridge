@@ -1,12 +1,12 @@
 /**
  * user_register_bridge - Kafka Producer
  * Safe for large API migrations
+ * Moves to next table if no new data for 10 seconds
  */
 
 const axios = require('axios');
 const { producer } = require('../../config/kafka_config');
 
-// Utility delay
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
 // Chunk array into smaller Kafka-safe batches
@@ -26,6 +26,7 @@ async function runUserRegisterProducer() {
 
   let offset = 0;
   let totalSent = 0;
+  let lastInsertTime = Date.now();
 
   try {
     await producer.connect();
@@ -47,31 +48,25 @@ async function runUserRegisterProducer() {
         break;
       }
 
-      // ✅ Robust key fix for Kafka
+      // Update last insert time if any records fetched
+      if (data.length > 0) lastInsertTime = Date.now();
+
+      // Robust key fix for Kafka
       const messages = data
-        .filter(row => row) // remove null/undefined rows
+        .filter(row => row)
         .map(row => {
           let key = row.reg_id;
-
-          // Ensure key is a valid positive number; else fallback
           if (!key || typeof key !== 'number' || key <= 0) {
             key = `temp_${Date.now()}_${Math.floor(Math.random() * 1000000)}`;
           }
-
-          return {
-            key: String(key),   // always string, never null/undefined
-            value: JSON.stringify(row),
-          };
+          return { key: String(key), value: JSON.stringify(row) };
         });
 
       const kafkaChunks = chunkArray(messages, KAFKA_BATCH_SIZE);
 
       for (const chunk of kafkaChunks) {
         try {
-          await producer.send({
-            topic: TOPIC,
-            messages: chunk,
-          });
+          await producer.send({ topic: TOPIC, messages: chunk });
           totalSent += chunk.length;
         } catch (err) {
           console.error('❌ Kafka send failed for a batch:', err);
@@ -81,6 +76,12 @@ async function runUserRegisterProducer() {
       console.log(`📦 Sent ${messages.length} messages (Total ${totalSent})`);
       offset += API_BATCH_SIZE;
       await delay(100);
+
+      // 10-second inactivity check
+      if (Date.now() - lastInsertTime > 10000) {
+        console.log('⏱ 10 seconds no new data, moving to next table...');
+        break; // exit while loop to move to next table
+      }
     }
   } catch (err) {
     console.error('❌ User Register Producer error:', err);

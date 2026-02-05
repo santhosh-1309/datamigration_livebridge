@@ -1,5 +1,5 @@
 /**
- * user_register_bridge - Kafka Consumer (Safe Encryption Version)
+ * user_register_bridge - Kafka Consumer (Safe Encryption + Batch Insert)
  * Dynamic target table support
  */
 
@@ -76,10 +76,19 @@ async function runUserRegisterConsumer() {
 
   console.log('✅ User Register Consumer Running');
 
+  const BATCH_SIZE = 500; // Adjust for performance
+
   await userRegisterConsumer.run({
     eachBatchAutoResolve: false,
 
     eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
+
+      const batchData = TARGET_TABLE.map(target => ({
+        db: target.db,
+        table: target.table,
+        inserts: []
+      }));
+
       for (const message of batch.messages) {
         let data;
 
@@ -91,112 +100,86 @@ async function runUserRegisterConsumer() {
           continue;
         }
 
-        try {
-          const mobile = normalizeMobile(data.mobile_number);
-          if (!mobile) {
-            await logError(data, 'INVALID_MOBILE');
-            resolveOffset(message.offset);
-            continue;
-          }
-
-          const encMobile = safeEncrypt(mobile);
-          const altMobile = normalizeMobile(data.mobile_number2);
-          const encAlt = safeEncrypt(altMobile);
-          const email = cleanEmail(data.email_id);
-          const encEmail = safeEncrypt(email);
-
-          for (const target of TARGET_TABLE) {
-            const { db, table } = target;
-
-            const [rows] = await db.query(
-              `SELECT reg_id, old_reg_id
-               FROM ${table}
-               WHERE normalized_mobile = ?`,
-              [mobile]
-            );
-
-            const insertSQL = `
-              INSERT INTO ${table}
-              (reg_id, name, mobile_number, alternative_mobile_number,
-               email_id, normalized_mobile, actual_city, actual_source, crm_log_id, created_log)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `;
-
-            const updateSQL = `
-              UPDATE ${table}
-              SET
-                reg_id = ?,
-                old_reg_id = ?,
-                name = IFNULL(?, name),
-                email_id = IFNULL(?, email_id),
-                alternative_mobile_number = IFNULL(?, alternative_mobile_number),
-                crm_log_id = IFNULL(?, crm_log_id),
-                mod_log = CURRENT_TIMESTAMP
-              WHERE normalized_mobile = ?
-            `;
-
-            if (!rows.length) {
-              const params = [
-                data.reg_id,
-                data.name || null,
-                encMobile,
-                encAlt,
-                encEmail,
-                mobile,
-                data.City || null,
-                data.source || null,
-                data.crm_log_id || null,
-                data.log
-              ];
-
-              try {
-                await db.query(insertSQL, params);
-              } catch (err) {
-                await logError(data, 'INSERT_FAILED: ' + err.message, table);
-              }
-
-            } else {
-              const currentRegId = rows[0].reg_id;
-              let oldIds = rows[0].old_reg_id
-                ? rows[0].old_reg_id.split(',')
-                : [];
-
-              if (data.reg_id !== currentRegId) {
-                oldIds.unshift(currentRegId.toString());
-              }
-
-              oldIds = [...new Set(oldIds)];
-
-              const params = [
-                data.reg_id,
-                oldIds.join(','),
-                data.name,
-                encEmail,
-                encAlt,
-                data.crm_log_id,
-                mobile
-              ];
-
-              try {
-                await db.query(updateSQL, params);
-              } catch (err) {
-                await logError(data, 'UPDATE_FAILED: ' + err.message, table);
-              }
-            }
-          }
-
+        const mobile = normalizeMobile(data.mobile_number);
+        if (!mobile) {
+          await logError(data, 'INVALID_MOBILE');
           resolveOffset(message.offset);
-          await heartbeat();
+          continue;
+        }
 
-        } catch (err) {
-          await logError(data, 'PROCESSING_FAILED: ' + err.message);
-          resolveOffset(message.offset);
+        const encMobile = safeEncrypt(mobile);
+        const altMobile = normalizeMobile(data.mobile_number2);
+        const encAlt = safeEncrypt(altMobile);
+        const email = cleanEmail(data.email_id);
+        const encEmail = safeEncrypt(email);
+
+        // Prepare batch insert for all target tables
+        batchData.forEach(batchItem => {
+          batchItem.inserts.push([
+            data.reg_id,
+            data.name || null,
+            encMobile,
+            encAlt,
+            encEmail,
+            mobile,
+            data.City || null,
+            data.source || null,
+            data.crm_log_id || null,
+            data.log
+          ]);
+        });
+
+        resolveOffset(message.offset);
+        await heartbeat();
+
+        // If batch size reached, insert
+        for (const batchItem of batchData) {
+          if (batchItem.inserts.length >= BATCH_SIZE) {
+            await insertBatch(batchItem);
+            batchItem.inserts = [];
+          }
+        }
+      }
+
+      // Insert remaining records
+      for (const batchItem of batchData) {
+        if (batchItem.inserts.length > 0) {
+          await insertBatch(batchItem);
         }
       }
 
       await commitOffsetsIfNecessary();
     }
   });
+}
+
+/* ---------- Batch Insert Helper ---------- */
+async function insertBatch({ db, table, inserts }) {
+  const insertSQL = `
+    INSERT INTO ${table}
+    (reg_id, name, mobile_number, alternative_mobile_number,
+     email_id, normalized_mobile, actual_city, actual_source, crm_log_id, created_log)
+    VALUES ?
+    ON DUPLICATE KEY UPDATE
+      name = VALUES(name),
+      email_id = VALUES(email_id),
+      alternative_mobile_number = VALUES(alternative_mobile_number),
+      crm_log_id = VALUES(crm_log_id),
+      mod_log = CURRENT_TIMESTAMP
+  `;
+  try {
+    await db.query(insertSQL, [inserts]);
+  } catch (err) {
+    console.error(`❌ Batch insert failed for ${table}:`, err.message);
+    // Log each row individually
+    for (const row of inserts) {
+      await logError({
+        reg_id: row[0],
+        mobile: row[2],
+        email: row[4]
+      }, 'BATCH_INSERT_FAILED: ' + err.message, table);
+    }
+  }
 }
 
 /* ---------- Bootstrap ---------- */
