@@ -8,206 +8,177 @@ const BASE_DIR = __dirname;
 const CYCLE_DELAY = config.cycleDelayMs || 60000;
 const MODE = config.mode || "once";
 
+const PRODUCER_RETRY = 1;
+const KAFKA_TIMEOUT = 6 * 60 * 60; // 6 hours
+
 // --------------------
 // Helpers
 // --------------------
-function sleep(ms) {
-  return new Promise((res) => setTimeout(res, ms));
-}
-
-function resolvePath(p) {
-  return path.resolve(BASE_DIR, p);
-}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const resolvePath = (p) => path.resolve(BASE_DIR, p);
 
 // --------------------
-// Run node script (blocking)
+// Run producer (blocking, retry)
 // --------------------
-function runProcess(script, label, cwd = "") {
-  return new Promise((resolve, reject) => {
-    const fullPath = resolvePath(path.join(cwd, script));
-
-    if (!fs.existsSync(fullPath)) {
-      return reject(new Error(`File not found: ${fullPath}`));
-    }
-
-    console.log(`▶ ${label}: ${fullPath}`);
-
-    const proc = spawn("node", [fullPath], {
-      stdio: "inherit",
-      shell: true,
-    });
-
-    proc.on("exit", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(`${label} failed (${code})`));
-    });
-  });
-}
-
-// --------------------
-// Start consumer in background (PM2)
-// --------------------
-function startBackgroundProcess(script, name, cwd = "") {
+async function runProducer(script, label, cwd = "") {
   const fullPath = resolvePath(path.join(cwd, script));
 
-  if (!fs.existsSync(fullPath)) {
-    throw new Error(`File not found: ${fullPath}`);
+  for (let attempt = 1; attempt <= PRODUCER_RETRY + 1; attempt++) {
+    try {
+      console.log(`▶ ${label} (attempt ${attempt})`);
+
+      await new Promise((resolve, reject) => {
+        const p = spawn("node", [fullPath], {
+          stdio: "inherit",
+          shell: true,
+        });
+
+        p.on("exit", (code) =>
+          code === 0 ? resolve() : reject(new Error(`Exit ${code}`))
+        );
+      });
+
+      return true;
+    } catch (e) {
+      console.error(`⚠ Producer failed: ${e.message}`);
+      if (attempt > PRODUCER_RETRY) return false;
+      await sleep(5000);
+    }
   }
-
-  console.log(`▶ Starting background ${name}: ${fullPath}`);
-
-  execSync(
-    `pm2 start ${fullPath} --name ${name} --interpreter node`,
-    { stdio: "inherit" }
-  );
 }
 
 // --------------------
-// Kafka status helper (FIXED)
+// Consumer (PM2 safe start)
+// --------------------
+function startConsumer(script, name, cwd = "") {
+  const fullPath = resolvePath(path.join(cwd, script));
+
+  try {
+    execSync(`pm2 describe ${name}`, { stdio: "ignore" });
+    console.log(`ℹ Consumer already running: ${name}`);
+  } catch {
+    execSync(`pm2 start ${fullPath} --name ${name} --interpreter node`, {
+      stdio: "inherit",
+    });
+  }
+}
+
+function stopConsumer(name) {
+  try {
+    execSync(`pm2 stop ${name}`);
+    execSync(`pm2 delete ${name}`);
+  } catch {}
+}
+
+// --------------------
+// Kafka helpers
 // --------------------
 function getKafkaStatus(group) {
   try {
-    const output = execSync(
+    const out = execSync(
       `kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group ${group}`,
       { stdio: "pipe" }
     ).toString();
 
-    const lines = output.split("\n").slice(1).filter(Boolean);
+    const lines = out.split("\n").slice(1).filter(Boolean);
 
-    let totalLag = 0;
-    let totalLogEnd = 0;
+    let lag = 0,
+      logEnd = 0;
 
-    for (const line of lines) {
-      const cols = line.trim().split(/\s+/);
-
-      const logEnd = cols[5] === "-" ? 0 : Number(cols[5]);
-      const lag = cols[6] === "-" ? 0 : Number(cols[6]);
-
-      totalLogEnd += logEnd;
-      totalLag += lag;
+    for (const l of lines) {
+      const c = l.trim().split(/\s+/);
+      logEnd += c[5] === "-" ? 0 : Number(c[5]);
+      lag += c[6] === "-" ? 0 : Number(c[6]);
     }
 
-    return { totalLag, totalLogEnd };
+    return { lag, logEnd };
   } catch {
     return null;
   }
 }
 
 // --------------------
-// Wait for Kafka drain (SAFE)
+// Wait Kafka drain (timeout safe)
 // --------------------
-async function waitForKafkaLag(group) {
-  console.log(`⏳ Waiting for Kafka drain | group: ${group}`);
+async function waitForKafka(group) {
   const start = Date.now();
 
   while (true) {
-    const status = getKafkaStatus(group);
-    const elapsed = Math.floor((Date.now() - start) / 1000);
+    const s = getKafkaStatus(group);
+    const elapsed = (Date.now() - start) / 1000;
 
-    if (!status) {
-      console.log(`⚠ Group not ready | ⏱ ${elapsed}s`);
+    if (s) {
+      console.log(`📊 logEnd=${s.logEnd}, lag=${s.lag}`);
+      if (s.logEnd === 0 || s.lag === 0) return true;
     } else {
-      const { totalLag, totalLogEnd } = status;
-
-      console.log(
-        `📊 logEnd=${totalLogEnd}, lag=${totalLag} | ⏱ ${elapsed}s`
-      );
-
-      // ✅ Either no data OR fully consumed
-      if (totalLogEnd === 0 || totalLag === 0) break;
+      console.log("⚠ Kafka group not ready");
     }
 
-    // Optional safety timeout (6 hours)
-    if (elapsed > 6 * 60 * 60) {
-      throw new Error(`Kafka drain timeout for group ${group}`);
+    if (elapsed > KAFKA_TIMEOUT) {
+      console.error("⏱ Kafka timeout — skipping table");
+      return false;
     }
 
     await sleep(60000);
   }
-
-  console.log(
-    `✅ Kafka drained | ${Math.floor((Date.now() - start) / 1000)}s`
-  );
 }
 
 // --------------------
-// Run single cycle
+// Run cycle
 // --------------------
-async function runSingleCycle(cycleNo) {
-  console.log(`\n🔁 STARTING CYCLE #${cycleNo}`);
+async function runSingleCycle(cycle) {
+  console.log(`\n🔁 STARTING CYCLE #${cycle}`);
 
   for (const step of config.steps) {
     console.log(`\n📦 TABLE: ${step.name}`);
-    const groupName = `migration_${step.name}_group`;
-    const tableStart = Date.now();
+    const group = `migration_${step.name}_group`;
+    const consumerName = `consumer_${step.name}`;
+    const start = Date.now();
 
-    // 1️⃣ Start consumer
-    startBackgroundProcess(
-      step.consumer,
-      `consumer_${step.name}`,
-      step.path
-    );
-
-    // 2️⃣ Run producer
-    await runProcess(
-      step.producer,
-      `Producer ${step.name}`,
-      step.path
-    );
-
-    // 3️⃣ Wait for Kafka drain
-    await waitForKafkaLag(groupName);
-
-    // 4️⃣ Stop consumer
     try {
-      execSync(`pm2 stop consumer_${step.name}`);
-      execSync(`pm2 delete consumer_${step.name}`);
-      console.log(`✅ Consumer stopped: ${step.name}`);
-    } catch {
-      console.log(`⚠ Consumer already stopped: ${step.name}`);
+      startConsumer(step.consumer, consumerName, step.path);
+
+      const producerOk = await runProducer(
+        step.producer,
+        `Producer ${step.name}`,
+        step.path
+      );
+
+      if (producerOk) {
+        await waitForKafka(group);
+      } else {
+        console.error(`⚠ Producer skipped for ${step.name}`);
+      }
+    } catch (e) {
+      console.error(`💥 Table error: ${e.message}`);
+    } finally {
+      stopConsumer(consumerName);
+      console.log(
+        `🎯 TABLE DONE: ${step.name} | ${Math.floor(
+          (Date.now() - start) / 1000
+        )}s`
+      );
     }
-
-    console.log(
-      `🎯 TABLE DONE: ${step.name} | ${Math.floor(
-        (Date.now() - tableStart) / 1000
-      )}s`
-    );
   }
-
-  console.log(`🎯 CYCLE #${cycleNo} COMPLETED`);
 }
 
 // --------------------
 // Orchestrator
 // --------------------
-async function startOrchestrator() {
+async function start() {
   let cycle = 1;
 
   while (true) {
-    try {
-      await runSingleCycle(cycle);
-    } catch (err) {
-      console.error("💥 Orchestrator error:", err.message);
-    }
+    await runSingleCycle(cycle);
 
     if (MODE !== "cycle") {
-      console.log("🛑 Single-run mode completed. Exiting.");
+      console.log("🛑 Migration finished");
       process.exit(0);
     }
 
-    console.log(`⏸ Waiting ${CYCLE_DELAY / 1000}s before next cycle`);
     await sleep(CYCLE_DELAY);
     cycle++;
   }
 }
 
-startOrchestrator();
-
-/*
-PM2 Commands:
-
-pm2 start orchestrator.js --name kafka-migration-orchestrator
-pm2 stop kafka-migration-orchestrator
-pm2 restart kafka-migration-orchestrator
-pm2 logs kafka-migration-orchestrator
-*/
+start();

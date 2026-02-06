@@ -1,6 +1,6 @@
 /**
  * user_vehicle_bridge - Kafka Consumer
- * Dynamic-table version (same as user_register)
+ * Dynamic-table version with batch inserts and updates + 10-sec inactivity catch
  */
 
 const { uservechicleConsumer } = require("../../config/kafka_config");
@@ -18,7 +18,10 @@ const TARGET_TABLE = [
 ];
 
 const MIGRATION_STEP = "user_vehicle_bridge_migration";
-const TOPIC = "user_vechicle_bridge_migration";
+const TOPIC = "user_vechicle_bridge_migration"; migration_user_vechile_group
+
+// Max rows per batch insert to DB
+const BATCH_SIZE = 500;
 
 /* ---------- Safe Encryption ---------- */
 function safeEncrypt(input) {
@@ -35,7 +38,6 @@ function safeEncrypt(input) {
 async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join(",")) {
   try {
     if (!uatDB) return;
-
     await uatDB.query(
       `INSERT INTO migration_error_log
        (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
@@ -54,6 +56,15 @@ async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join("
   }
 }
 
+/* ---------- Helper: chunk array ---------- */
+function chunkArray(arr, size) {
+  const chunks = [];
+  for (let i = 0; i < arr.length; i += size) {
+    chunks.push(arr.slice(i, i + size));
+  }
+  return chunks;
+}
+
 /* ---------- Consumer ---------- */
 async function runUserVehicleConsumer() {
   await uservechicleConsumer.connect();
@@ -61,109 +72,117 @@ async function runUserVehicleConsumer() {
 
   console.log("✅ User Vehicle Consumer Running");
 
+  let lastMessageTime = Date.now();
+
   await uservechicleConsumer.run({
     eachBatchAutoResolve: false,
 
     eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
-      for (const message of batch.messages) {
-        let data;
+      if (!batch.messages.length) return;
 
+      // Parse messages
+      const messages = batch.messages.map(m => {
         try {
-          data = JSON.parse(message.value.toString());
+          return JSON.parse(m.value.toString());
         } catch {
-          await logError({}, "INVALID_JSON");
-          resolveOffset(message.offset);
-          continue;
+          logError({}, "INVALID_JSON");
+          return null;
         }
+      }).filter(Boolean);
 
-        // Business rule unchanged
-        if (data.type !== "4w") {
-          resolveOffset(message.offset);
-          await heartbeat();
-          continue;
-        }
+      if (messages.length > 0) lastMessageTime = Date.now();
 
-        try {
+      for (const target of TARGET_TABLE) {
+        const { db, table } = target;
+
+        // Separate inserts and updates
+        const inserts = [];
+        const updates = [];
+
+        for (const data of messages) {
+          if (data.type !== "4w") continue;
           const encVehRegNo = safeEncrypt(data.reg_no);
 
-          for (const target of TARGET_TABLE) {
-            const { db, table } = target;
+          const [rows] = await db.query(`SELECT id FROM ${table} WHERE id = ?`, [data.id]);
 
-            const [rows] = await db.query(
-              `SELECT id FROM ${table} WHERE id = ?`,
-              [data.id]
-            );
+          if (!rows.length) {
+            inserts.push([
+              data.id,
+              data.user_id || null,
+              encVehRegNo,
+              data.fuel_type || null,
+              data.odo_reading || null,
+              data.brand || null,
+              data.model || null,
+              data.log,
+              data.vehicle_id
+            ]);
+          } else {
+            updates.push([
+              data.user_id,
+              encVehRegNo,
+              data.fuel_type,
+              data.odo_reading,
+              data.brand,
+              data.model,
+              data.vehicle_id,
+              data.id
+            ]);
+          }
+        }
 
-            const insertSQL = `
-              INSERT INTO ${table}
-              (id, reg_id, veh_reg_no, fuel_type, odometerReading,
-               make_name, model_name, created_log, vehicle_id)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            `;
+        // Batch inserts
+        for (const chunk of chunkArray(inserts, BATCH_SIZE)) {
+          if (chunk.length === 0) continue;
+          const insertSQL = `
+            INSERT INTO ${table}
+            (id, reg_id, veh_reg_no, fuel_type, odometerReading,
+             make_name, model_name, created_log, vehicle_id)
+            VALUES ?
+          `;
+          try {
+            await db.query(insertSQL, [chunk]);
+          } catch (err) {
+            for (const row of chunk) await logError({ id: row[0] }, "INSERT_FAILED: " + err.message, table);
+          }
+        }
 
-            const updateSQL = `
-              UPDATE ${table}
-              SET
-                reg_id = IFNULL(?, reg_id),
-                veh_reg_no = IFNULL(?, veh_reg_no),
-                fuel_type = IFNULL(?, fuel_type),
-                odometerReading = IFNULL(?, odometerReading),
-                make_name = IFNULL(?, make_name),
-                model_name = IFNULL(?, model_name),
-                vehicle_id = IFNULL(?, vehicle_id),
-                mod_log = CURRENT_TIMESTAMP
-              WHERE id = ?
-            `;
-
-            if (!rows.length) {
-              const params = [
-                data.id,
-                data.user_id || null,
-                encVehRegNo,
-                data.fuel_type || null,
-                data.odo_reading || null,
-                data.brand || null,
-                data.model || null,
-                data.log,
-                data.vehicle_id
-              ];
-
-              try {
-                await db.query(insertSQL, params);
-              } catch (err) {
-                await logError(data, "INSERT_FAILED: " + err.message, table);
-              }
-
-            } else {
-              const params = [
-                data.user_id,
-                encVehRegNo,
-                data.fuel_type,
-                data.odo_reading,
-                data.brand,
-                data.model,
-                data.vehicle_id,
-                data.id
-              ];
-
-              try {
-                await db.query(updateSQL, params);
-              } catch (err) {
-                await logError(data, "UPDATE_FAILED: " + err.message, table);
-              }
+        // Batch updates
+        for (const chunk of chunkArray(updates, BATCH_SIZE)) {
+          if (chunk.length === 0) continue;
+          const updateSQL = `
+            UPDATE ${table}
+            SET
+              reg_id = IFNULL(?, reg_id),
+              veh_reg_no = IFNULL(?, veh_reg_no),
+              fuel_type = IFNULL(?, fuel_type),
+              odometerReading = IFNULL(?, odometerReading),
+              make_name = IFNULL(?, make_name),
+              model_name = IFNULL(?, model_name),
+              vehicle_id = IFNULL(?, vehicle_id),
+              mod_log = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `;
+          for (const params of chunk) {
+            try {
+              await db.query(updateSQL, params);
+            } catch (err) {
+              await logError({ id: params[7] }, "UPDATE_FAILED: " + err.message, table);
             }
           }
-
-          resolveOffset(message.offset);
-          await heartbeat();
-
-        } catch (err) {
-          await logError(data, "PROCESSING_FAILED: " + err.message);
-          resolveOffset(message.offset);
         }
       }
 
+      // Resolve offsets
+      for (const message of batch.messages) resolveOffset(message.offset);
+      await heartbeat();
       await commitOffsetsIfNecessary();
+
+      // 10-second inactivity catch
+      if (Date.now() - lastMessageTime > 10000) {
+        console.log("⏱ 10 seconds no new messages, exiting batch to move to next table...");
+        process.exit(0);
+      }
     }
   });
 }

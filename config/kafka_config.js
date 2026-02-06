@@ -26,7 +26,7 @@ const feedbackConsumer = kafka.consumer({ groupId: 'migration_feedback_track_gro
 const adminCommentsConsumer = kafka.consumer({ groupId: 'migration_admin_comments_group' });
 
 // user reg
-const uservechicleConsumer =  kafka.consumer({ groupId: 'migration_user_vechile_group'});
+const uservechicleConsumer =  kafka.consumer({ groupId: 'migration_user_vehicle_group'});
 
 
 
@@ -40,8 +40,5 @@ module.exports = {
   feedbackConsumer,
   adminCommentsConsumer,
   uservechicleConsumer
-
-
-
 };
   

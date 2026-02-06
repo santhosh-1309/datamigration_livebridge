@@ -1,6 +1,6 @@
 /**
  * b2b_booking_bridge - Kafka Consumer
- * Fully uniform with user_register consumer
+ * Fast batch insert (500) – Orchestrator compatible
  */
 
 const { b2bBookingConsumer } = require('../../config/kafka_config');
@@ -10,57 +10,71 @@ console.log('🚀 B2B Booking Consumer started');
 
 /* ---------- Constants ---------- */
 const SOURCE_TABLE = 'b2b_booking_work';
+
 const TARGET_TABLE = [
-  'UAT_mytvs_bridge.b2b_booking_tbl_uat',
-  'mytvs_bridge.b2b_booking_tbl'
+  { db: uatDB, table: 'UAT_mytvs_bridge.b2b_booking_tbl_uat' },
+  { db: liveDB, table: 'mytvs_bridge.b2b_booking_tbl' }
 ];
-const MIGRATION_STEP = 'b2b_booking_bridge_migration';
+
 const TOPIC = 'b2b_booking_bridge_migration';
+const MIGRATION_STEP = 'b2b_booking_bridge_migration';
+const BATCH_SIZE = 500;
 const MIN_DATE = new Date('2023-12-31T23:59:59Z');
 
-/* ---------- Safe Error Logger ---------- */
-async function logError(data, msg, table = TARGET_TABLE.join(',')) {
+/* ---------- Error Logger ---------- */
+async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join(',')) {
   try {
     if (!uatDB) return;
 
-    const jsonData = (() => {
-      try { return JSON.stringify(data || {}); }
-      catch { return '{}'; }
-    })();
-
     await uatDB.query(
-      `INSERT INTO migration_error_log
-       (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
-       VALUES (?, ?, ?, ?, ?, ?)`,
+      `
+      INSERT INTO migration_error_log
+      (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
+      VALUES (?, ?, ?, ?, ?, ?)
+      `,
       [
         SOURCE_TABLE,
         table,
         data?.b2b_booking_id || null,
-        jsonData,
+        JSON.stringify(data || {}),
         msg,
         MIGRATION_STEP
       ]
     );
-  } catch (err) {
-    console.error('❌ Migration error log failed:', err.message || err);
+  } catch {
+    // silent
   }
 }
 
 /* ---------- Consumer ---------- */
 async function runB2BBookingConsumer() {
   await b2bBookingConsumer.connect();
-  await b2bBookingConsumer.subscribe({ topic: TOPIC, fromBeginning: true });
+  await b2bBookingConsumer.subscribe({
+    topic: TOPIC,
+    fromBeginning: true
+  });
 
-  console.log('✅ B2B Booking Consumer running');
+  console.log('✅ B2B Booking Consumer Running');
 
   await b2bBookingConsumer.run({
     eachBatchAutoResolve: false,
 
-    eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
+    eachBatch: async ({
+      batch,
+      resolveOffset,
+      heartbeat,
+      commitOffsetsIfNecessary
+    }) => {
+
+      const batchData = TARGET_TABLE.map(target => ({
+        db: target.db,
+        table: target.table,
+        inserts: []
+      }));
+
       for (const message of batch.messages) {
         let data;
 
-        /* ---------- JSON Parse ---------- */
         try {
           data = JSON.parse(message.value.toString());
         } catch {
@@ -69,60 +83,83 @@ async function runB2BBookingConsumer() {
           continue;
         }
 
-        // Skip rows before MIN_DATE
+        // Skip old rows
         if (!data.b2b_log || new Date(data.b2b_log) <= MIN_DATE) {
           resolveOffset(message.offset);
           continue;
         }
 
-        try {
-          for (const table of TARGET_TABLE) {
-            const insertSQL = `
-              INSERT INTO ${table}
-              (b2b_booking_id, booking_id, pickup_date, pickup_time, tvs_job_card_no, goaxled_log_date, migrated_data)
-              VALUES (?, ?, ?, ?, ?, ?, ?)
-              ON DUPLICATE KEY UPDATE
-                b2b_booking_id = VALUES(b2b_booking_id),
-                booking_id = VALUES(booking_id),
-                pickup_date = VALUES(pickup_date),
-                pickup_time = VALUES(pickup_time),
-                tvs_job_card_no = VALUES(tvs_job_card_no),
-                goaxled_log_date = VALUES(goaxled_log_date),
-                migrated_data = VALUES(migrated_data)
-            `;
+        batchData.forEach(batchItem => {
+          batchItem.inserts.push([
+            data.b2b_booking_id,
+            data.gb_booking_id || null,
+            data.pickup_date || null,
+            data.pickup_time || null,
+            data.tvs_job_card_no || null,
+            data.goaxled_log_date || null,
+            data.jsonData || null
+          ]);
+        });
 
-            const params = [
-              data.b2b_booking_id,
-              data.gb_booking_id,
-              data.pickup_date || null,
-              data.pickup_time || null,
-              data.tvs_job_card_no || null,
-              data.goaxled_log_date || null,
-              data.jsonData
-            ];
+        resolveOffset(message.offset);
+        await heartbeat();
 
-            try {
-              await Promise.all([
-                liveDB.query(insertSQL, params),
-                uatDB.query(insertSQL, params)
-              ]);
-            } catch (err) {
-              await logError(data, 'UPSERT_FAILED: ' + (err.message || err), table);
-            }
+        // Flush when batch size reached
+        for (const batchItem of batchData) {
+          if (batchItem.inserts.length >= BATCH_SIZE) {
+            await insertBatch(batchItem);
+            batchItem.inserts = [];
           }
+        }
+      }
 
-          resolveOffset(message.offset);
-          await heartbeat();
-
-        } catch (err) {
-          await logError(data, 'PROCESSING_FAILED: ' + (err.message || err));
-          resolveOffset(message.offset);
+      // Insert remaining rows
+      for (const batchItem of batchData) {
+        if (batchItem.inserts.length > 0) {
+          await insertBatch(batchItem);
         }
       }
 
       await commitOffsetsIfNecessary();
     }
   });
+}
+
+/* ---------- Batch Insert ---------- */
+async function insertBatch({ db, table, inserts }) {
+  const SQL = `
+    INSERT INTO ${table}
+    (
+      b2b_booking_id,
+      booking_id,
+      pickup_date,
+      pickup_time,
+      tvs_job_card_no,
+      goaxled_log_date,
+      migrated_data
+    )
+    VALUES ?
+    ON DUPLICATE KEY UPDATE
+      booking_id = VALUES(booking_id),
+      pickup_date = VALUES(pickup_date),
+      pickup_time = VALUES(pickup_time),
+      tvs_job_card_no = VALUES(tvs_job_card_no),
+      goaxled_log_date = VALUES(goaxled_log_date),
+      migrated_data = VALUES(migrated_data)
+  `;
+
+  try {
+    await db.query(SQL, [inserts]);
+  } catch (err) {
+    console.error(`❌ Batch insert failed for ${table}:`, err.message);
+    for (const row of inserts) {
+      await logError(
+        { b2b_booking_id: row[0] },
+        'BATCH_INSERT_FAILED: ' + err.message,
+        table
+      );
+    }
+  }
 }
 
 /* ---------- Bootstrap ---------- */
