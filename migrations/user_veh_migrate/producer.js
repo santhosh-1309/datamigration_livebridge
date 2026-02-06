@@ -19,7 +19,7 @@ function chunkArray(arr, size) {
 }
 
 async function runUserVehicleProducer() {
-  const API_BATCH_SIZE = 10000;   // fetch 10k at a time
+  const API_BATCH_SIZE = 5000;   // fetch 10k at a time
   const KAFKA_BATCH_SIZE = 200;   // send 200 messages per Kafka batch
   const TOPIC = 'user_vechicle_bridge_migration';
   const TABLE = 'user_vehicle_table';
@@ -37,7 +37,7 @@ async function runUserVehicleProducer() {
         'https://bridge.gobumpr.com/api/csv/get_csv.php',
         {
           params: { table: TABLE, limit: API_BATCH_SIZE, offset },
-          timeout: 30000,
+          timeout: 120000,
         }
       );
 
