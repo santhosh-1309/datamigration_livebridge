@@ -18,7 +18,7 @@ const TARGET_TABLE = [
 ];
 
 const MIGRATION_STEP = "user_vehicle_bridge_migration";
-const TOPIC = "user_vechicle_bridge_migration"; migration_user_vechile_group
+const TOPIC = "user_vechicle_bridge_migration"; 
 
 // Max rows per batch insert to DB
 const BATCH_SIZE = 500;
