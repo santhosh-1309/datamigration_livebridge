@@ -1,57 +1,86 @@
 const axios = require('axios');
-const { producer } = require('../../config/kafka_config');;
-// const producer = kafka.producer();
+const { producer } = require('../../config/kafka_config');
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
+// 🔧 CONFIG
+const API_BATCH_SIZE = 10000;     // API fetch size
+const KAFKA_CHUNK_SIZE = 500;     // Kafka safe chunk size
+const API_TIMEOUT = 30000;
+const TOPIC = 'user_vechicle_bridge_migration';
+const TABLE = 'user_vehicle_table';
+
 (async () => {
+  let offset = 0;
+
   try {
+    // 🔌 CONNECT PRODUCER
     await producer.connect();
-    console.log(`[${new Date().toISOString()}] ✅ Kafka producer connected.`);
+    console.log(`[${new Date().toISOString()}] ✅ Kafka producer connected`);
 
-    const batchSize = 10000;
-    let offset = 0;
-    const table = "user_vehicle_table";
-    let hasMore = true;
-
-    while (hasMore) {
-      console.log(`[${new Date().toISOString()}] ⏳ Fetching data from API: offset=${offset}, limit=${batchSize}`);
-
-      const res = await axios.get(
-        `https://bridge.gobumpr.com/api/csv/get_csv.php?limit=${batchSize}&offset=${offset}&table=${table}`,
-        { timeout: 30000 }
+    while (true) {
+      console.log(
+        `[${new Date().toISOString()}] ⏳ Fetching API data | offset=${offset}, limit=${API_BATCH_SIZE}`
       );
 
-      const data = res.data;
+      // 🌐 FETCH DATA FROM API
+      const response = await axios.get(
+        `https://bridge.gobumpr.com/api/csv/get_csv.php`,
+        {
+          params: {
+            limit: API_BATCH_SIZE,
+            offset,
+            table: TABLE
+          },
+          timeout: API_TIMEOUT
+        }
+      );
 
-      if (!data || !data.length) {
-        console.log(`[${new Date().toISOString()}] ✅ No more data to process. Exiting loop.`);
-        hasMore = false;
+      const rows = response.data;
+
+      if (!rows || rows.length === 0) {
+        console.log(`[${new Date().toISOString()}] ✅ No more data. Migration completed.`);
         break;
       }
 
-      const messages = data.map(row => ({
-        key: row.user_id ? String(row.user_id) : undefined, // 🔹 same logic as DB script
+      // 🧾 PREPARE KAFKA MESSAGES
+      const messages = rows.map(row => ({
+        key: row.user_id ? String(row.user_id) : null,
         value: JSON.stringify(row)
       }));
 
-      await producer.send({
-        topic: 'user_vechicle_bridge_migration',
-        messages
-      });
+      // 📦 SEND IN SAFE KAFKA CHUNKS
+      for (let i = 0; i < messages.length; i += KAFKA_CHUNK_SIZE) {
+        const chunk = messages.slice(i, i + KAFKA_CHUNK_SIZE);
+
+        await producer.send({
+          topic: TOPIC,
+          messages: chunk
+        });
+      }
 
       console.log(
-        `[${new Date().toISOString()}] 📦 Sent batch of ${messages.length} messages (offset: ${offset})`
+        `[${new Date().toISOString()}] 📤 Sent ${messages.length} messages | offset=${offset}`
       );
 
-      offset += batchSize;
+      offset += API_BATCH_SIZE;
+
+      // ⏸ SMALL DELAY TO AVOID BROKER OVERLOAD
       await delay(100);
     }
 
-  } catch (err) {
-    console.error(`[${new Date().toISOString()}] ❌ Fatal error in producer:`, err);
+  } catch (error) {
+    console.error(
+      `[${new Date().toISOString()}] ❌ Producer failed`,
+      error
+    );
   } finally {
-    await producer.disconnect();
-    console.log(`[${new Date().toISOString()}] 🔌 Kafka producer disconnected.`);
+    // 🔌 DISCONNECT SAFELY
+    try {
+      await producer.disconnect();
+      console.log(`[${new Date().toISOString()}] 🔌 Kafka producer disconnected`);
+    } catch (e) {
+      console.error('❌ Error during producer disconnect', e);
+    }
   }
 })();

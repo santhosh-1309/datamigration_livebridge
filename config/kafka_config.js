@@ -1,5 +1,4 @@
-// config/kafka_config.js
-const { Kafka, Partitioners } = require('kafkajs');
+const { Kafka, Partitioners, CompressionTypes } = require('kafkajs');
 
 const kafka = new Kafka({
   clientId: 'bridge-migration',
@@ -8,36 +7,16 @@ const kafka = new Kafka({
 
 const producer = kafka.producer({
   createPartitioner: Partitioners.LegacyPartitioner,
+  compression: CompressionTypes.GZIP, // ✅ compress messages
 });
 
-// User Register
-const userRegisterConsumer = kafka.consumer({ groupId: 'migration_user_register_group' });
-
-// User Booking
-const userBookingConsumer = kafka.consumer({ groupId: 'migration_user_booking_group' });
-
-// B2B Booking
-const b2bBookingConsumer = kafka.consumer({ groupId: 'migration_b2b_booking_group' });
-
-// Feedback Track / Service Buddy
-const feedbackConsumer = kafka.consumer({ groupId: 'migration_feedback_track_group' });
-
-// Admin Comments
-const adminCommentsConsumer = kafka.consumer({ groupId: 'migration_admin_comments_group' });
-
-// user reg
-const uservechicleConsumer =  kafka.consumer({ groupId: 'user_vechicle_bridge_migration'});
-
-
-
-
 module.exports = {
-  kafka,     // optional, for admin/debug
+  kafka,
   producer,
-  userRegisterConsumer,
-  userBookingConsumer,
-  b2bBookingConsumer,
-  feedbackConsumer,
-  adminCommentsConsumer,
-  uservechicleConsumer
+  userRegisterConsumer: kafka.consumer({ groupId: 'migration_user_register_group' }),
+  userBookingConsumer: kafka.consumer({ groupId: 'migration_user_booking_group' }),
+  b2bBookingConsumer: kafka.consumer({ groupId: 'migration_b2b_booking_group' }),
+  feedbackConsumer: kafka.consumer({ groupId: 'migration_feedback_track_group' }),
+  adminCommentsConsumer: kafka.consumer({ groupId: 'migration_admin_comments_group' }),
+  uservechicleConsumer: kafka.consumer({ groupId: 'user_vechicle_bridge_migration' }),
 };
