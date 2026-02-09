@@ -18,7 +18,7 @@ const TARGET_TABLE = [
 ];
 
 const MIGRATION_STEP = "user_vehicle_bridge_migration";
-const TOPIC = "user_vechicle_bridge_migration"; 
+const TOPIC = "user_vechicle_bridge_migration";
 
 // Max rows per batch insert to DB
 const BATCH_SIZE = 500;
@@ -79,6 +79,14 @@ async function runUserVehicleConsumer() {
 
     eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
       if (!batch.messages.length) return;
+
+      // Always resolve offsets first so the group exists
+      try {
+        for (const message of batch.messages) resolveOffset(message.offset);
+        await commitOffsetsIfNecessary(); // <-- ensures consumer group is visible
+      } catch (err) {
+        console.error("❌ Offset commit failed:", err);
+      }
 
       // Parse messages
       const messages = batch.messages.map(m => {
@@ -173,10 +181,7 @@ async function runUserVehicleConsumer() {
         }
       }
 
-      // Resolve offsets
-      for (const message of batch.messages) resolveOffset(message.offset);
       await heartbeat();
-      await commitOffsetsIfNecessary();
 
       // 10-second inactivity catch
       if (Date.now() - lastMessageTime > 10000) {
