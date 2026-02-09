@@ -1,6 +1,6 @@
 const axios = require('axios');
-const kafka = require('../../config/kafka_config');
-const producer = kafka.producer();
+const { producer } = require('../../config/kafka_config');;
+// const producer = kafka.producer();
 
 const delay = ms => new Promise(res => setTimeout(res, ms));
 
