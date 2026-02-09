@@ -1,25 +1,49 @@
 /**
- * user_vehicle_bridge - Kafka Consumer (Batch Insert)
+ * user_register_bridge - Kafka Consumer (Safe Encryption + Batch Insert)
+ * Dynamic target table support
  */
 
-const { uservechicleConsumer } = require('../../config/kafka_config');
+const { userRegisterConsumer } = require('../../config/kafka_config');
 const { liveDB, uatDB } = require('../../config/revamp_db');
+const { encrypt } = require('../../common/encryption');
 
-console.log("🚀 User Vehicle Consumer started");
+console.log("🚀 User Register Consumer started");
 
 /* ---------- Constants ---------- */
-const SOURCE_TABLE = 'go_bumpr.user_vehicle';
+const SOURCE_TABLE = 'go_bumpr.user_register';
 
 const TARGET_TABLE = [
-  { db: uatDB, table: 'UAT_mytvs_bridge.user_vehicle_uat' },
-  { db: liveDB, table: 'mytvs_bridge.user_vehicle' }
+  { db: uatDB, table: 'UAT_mytvs_bridge.user_register_uat' },
+  { db: liveDB, table: 'mytvs_bridge.user_register' }
 ];
 
-const MIGRATION_STEP = 'user_vehicle_bridge_migration';
-const TOPIC = 'user_vehicle_bridge_migration';
-const BATCH_SIZE = 500;
+const MIGRATION_STEP = 'user_register_bridge_migration';
 
-/* ---------- Error Logger ---------- */
+/* ---------- Helpers ---------- */
+function normalizeMobile(mobile) {
+  if (!mobile) return null;
+  const digits = mobile.replace(/\D/g, '');
+  return digits.length >= 10 ? digits.slice(-10) : null;
+}
+
+function cleanEmail(email) {
+  if (!email) return null;
+  const e = email.trim().toLowerCase();
+  return e.includes('@') ? e : null;
+}
+
+/* ---------- Safe Encryption ---------- */
+function safeEncrypt(input) {
+  if (!input) return null;
+  try {
+    return encrypt(input);
+  } catch (err) {
+    console.error('❌ Encryption failed for:', input, err.message);
+    return null;
+  }
+}
+
+/* ---------- Safe Error Logger ---------- */
 async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join(',')) {
   try {
     if (!uatDB) return;
@@ -31,72 +55,33 @@ async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join('
       [
         SOURCE_TABLE,
         table,
-        data?.vehicle_id || null,
+        data?.reg_id || null,
         JSON.stringify(data || {}),
         msg,
         MIGRATION_STEP
       ]
     );
   } catch (err) {
-    console.error('❌ Error log failed:', err.message);
-  }
-}
-
-/* ---------- Batch Insert ---------- */
-async function insertBatch({ db, table, inserts }) {
-  const sql = `
-    INSERT INTO ${table}
-    (
-      vehicle_id,
-      reg_id,
-      vehicle_number,
-      brand,
-      model,
-      fuel_type,
-      created_log
-    )
-    VALUES ?
-    ON DUPLICATE KEY UPDATE
-      brand = VALUES(brand),
-      model = VALUES(model),
-      fuel_type = VALUES(fuel_type),
-      mod_log = CURRENT_TIMESTAMP
-  `;
-
-  try {
-    await db.query(sql, [inserts]);
-  } catch (err) {
-    console.error(`❌ Batch insert failed for ${table}:`, err.message);
-
-    for (const row of inserts) {
-      await logError(
-        { vehicle_id: row[0], reg_id: row[1] },
-        'BATCH_INSERT_FAILED: ' + err.message,
-        table
-      );
-    }
+    console.error('❌ Migration error log failed:', err.message || err);
   }
 }
 
 /* ---------- Consumer ---------- */
-async function runUserVehicleConsumer() {
-  await uservechicleConsumer.connect();
-  await uservechicleConsumer.subscribe({
-    topic: TOPIC,
+async function runUserRegisterConsumer() {
+  await userRegisterConsumer.connect();
+  await userRegisterConsumer.subscribe({
+    topic: 'user_register_bridge_migration',
     fromBeginning: true
   });
 
-  console.log('✅ User Vehicle Consumer Running');
+  console.log('✅ User Register Consumer Running');
 
-  await uservechicleConsumer.run({
+  const BATCH_SIZE = 500; // Adjust for performance
+
+  await userRegisterConsumer.run({
     eachBatchAutoResolve: false,
 
-    eachBatch: async ({
-      batch,
-      resolveOffset,
-      heartbeat,
-      commitOffsetsIfNecessary
-    }) => {
+    eachBatch: async ({ batch, resolveOffset, heartbeat, commitOffsetsIfNecessary }) => {
 
       const batchData = TARGET_TABLE.map(target => ({
         db: target.db,
@@ -115,15 +100,31 @@ async function runUserVehicleConsumer() {
           continue;
         }
 
-        // Prepare insert rows
-        batchData.forEach(b => {
-          b.inserts.push([
-            data.vehicle_id,
+        const mobile = normalizeMobile(data.mobile_number);
+        if (!mobile) {
+          await logError(data, 'INVALID_MOBILE');
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        const encMobile = safeEncrypt(mobile);
+        const altMobile = normalizeMobile(data.mobile_number2);
+        const encAlt = safeEncrypt(altMobile);
+        const email = cleanEmail(data.email_id);
+        const encEmail = safeEncrypt(email);
+
+        // Prepare batch insert for all target tables
+        batchData.forEach(batchItem => {
+          batchItem.inserts.push([
             data.reg_id,
-            data.vehicle_number || null,
-            data.brand || null,
-            data.model || null,
-            data.fuel_type || null,
+            data.name || null,
+            encMobile,
+            encAlt,
+            encEmail,
+            mobile,
+            data.City || null,
+            data.source || null,
+            data.crm_log_id || null,
             data.log
           ]);
         });
@@ -131,19 +132,19 @@ async function runUserVehicleConsumer() {
         resolveOffset(message.offset);
         await heartbeat();
 
-        // Insert once batch hits size
-        for (const b of batchData) {
-          if (b.inserts.length >= BATCH_SIZE) {
-            await insertBatch(b);
-            b.inserts = [];
+        // If batch size reached, insert
+        for (const batchItem of batchData) {
+          if (batchItem.inserts.length >= BATCH_SIZE) {
+            await insertBatch(batchItem);
+            batchItem.inserts = [];
           }
         }
       }
 
-      // Insert remaining rows
-      for (const b of batchData) {
-        if (b.inserts.length > 0) {
-          await insertBatch(b);
+      // Insert remaining records
+      for (const batchItem of batchData) {
+        if (batchItem.inserts.length > 0) {
+          await insertBatch(batchItem);
         }
       }
 
@@ -152,10 +153,39 @@ async function runUserVehicleConsumer() {
   });
 }
 
+/* ---------- Batch Insert Helper ---------- */
+async function insertBatch({ db, table, inserts }) {
+  const insertSQL = `
+    INSERT INTO ${table}
+    (reg_id, name, mobile_number, alternative_mobile_number,
+     email_id, normalized_mobile, actual_city, actual_source, crm_log_id, created_log)
+    VALUES ?
+    ON DUPLICATE KEY UPDATE
+      name = VALUES(name),
+      email_id = VALUES(email_id),
+      alternative_mobile_number = VALUES(alternative_mobile_number),
+      crm_log_id = VALUES(crm_log_id),
+      mod_log = CURRENT_TIMESTAMP
+  `;
+  try {
+    await db.query(insertSQL, [inserts]);
+  } catch (err) {
+    console.error(`❌ Batch insert failed for ${table}:`, err.message);
+    // Log each row individually
+    for (const row of inserts) {
+      await logError({
+        reg_id: row[0],
+        mobile: row[2],
+        email: row[4]
+      }, 'BATCH_INSERT_FAILED: ' + err.message, table);
+    }
+  }
+}
+
 /* ---------- Bootstrap ---------- */
-runUserVehicleConsumer().catch(err => {
-  console.error("❌ User Vehicle Consumer fatal:", err);
+runUserRegisterConsumer().catch(err => {
+  console.error("❌ User Register Consumer fatal:", err);
   process.exit(1);
 });
 
-module.exports = runUserVehicleConsumer;
+module.exports = runUserRegisterConsumer;
