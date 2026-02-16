@@ -18,6 +18,48 @@ const MIGRATION_STEP = "admin_comments_bridge_migration";
 const TOPIC = "admin_comments_migration";
 const MIN_DATE = new Date('2023-12-31T23:59:59Z');
 
+/* ---------- NEW: Booking Cache ---------- */
+const bookingCache = new Map();
+
+/* ---------- NEW: Booking existence checker ---------- */
+async function bookingExists(bookId) {
+
+  if (!bookId) return false;
+
+  // cache hit
+  if (bookingCache.has(bookId)) {
+    return bookingCache.get(bookId);
+  }
+
+  try {
+
+    // check LIVE
+    const [liveRows] = await liveDB.query(
+      `SELECT booking_id FROM mytvs_bridge.user_booking WHERE booking_id = ? LIMIT 1`,
+      [bookId]
+    );
+
+    if (liveRows.length) {
+      bookingCache.set(bookId, true);
+      return true;
+    }
+
+    // check UAT
+    const [uatRows] = await uatDB.query(
+      `SELECT booking_id FROM UAT_mytvs_bridge.user_booking_uat WHERE booking_id = ? LIMIT 1`,
+      [bookId]
+    );
+
+    const exists = uatRows.length > 0;
+    bookingCache.set(bookId, exists);
+    return exists;
+
+  } catch (err) {
+    console.error("Booking lookup failed:", err.message);
+    return false;
+  }
+}
+
 /* ---------- Safe Error Logger ---------- */
 async function logError(data, msg, table = TARGET_TABLE.join(',')) {
   try {
@@ -76,12 +118,24 @@ async function runAdminCommentsConsumer() {
         }
 
         try {
-          // Skip rows before the MIN_DATE
+
+          /* ---- KEEP YOUR DATE FILTER ---- */
           if (!data.created_log || new Date(data.created_log) <= MIN_DATE) {
             resolveOffset(message.offset);
             continue;
           }
 
+          /* ---- NEW: BOOKING GATE ---- */
+          const exists = await bookingExists(data.book_id);
+
+          if (!exists) {
+            // booking not migrated yet → skip comment safely
+            resolveOffset(message.offset);
+            await heartbeat();
+            continue;
+          }
+
+          /* ---- ORIGINAL LOGIC CONTINUES UNCHANGED ---- */
           for (const table of TARGET_TABLE) {
             const [rows] = await uatDB.query(
               `SELECT id FROM ${table} WHERE id = ?`,
