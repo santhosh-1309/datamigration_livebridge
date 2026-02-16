@@ -1,6 +1,6 @@
 /**
  * user_booking_bridge - Kafka Consumer
- * Fast batch insert (500) – Orchestrator compatible
+ * Inserts only bookings created AFTER 31-Dec-2023 23:59:59
  */
 
 const { userBookingConsumer } = require('../../config/kafka_config');
@@ -20,17 +20,28 @@ const TOPIC = 'user_booking_tb_migration';
 const MIGRATION_STEP = 'user_booking_bridge_migration';
 const BATCH_SIZE = 500;
 
+/* >>> CUTOFF DATE <<< */
+const MIGRATION_START_DATE = new Date('2023-12-31T23:59:59');
+
+/* ---------- Helpers ---------- */
+
+/* MySQL datetime → reliable JS date */
+function parseMysqlDate(mysqlDate) {
+  if (!mysqlDate) return null;
+
+  // converts "2023-12-31 23:59:59" → "2023-12-31T23:59:59"
+  return new Date(mysqlDate.replace(' ', 'T'));
+}
+
 /* ---------- Error Logger ---------- */
 async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join(',')) {
   try {
     if (!uatDB) return;
 
     await uatDB.query(
-      `
-      INSERT INTO migration_error_log
+      `INSERT INTO migration_error_log
       (source_table, target_table, source_primary_key, failed_data, error_message, migration_step)
-      VALUES (?, ?, ?, ?, ?, ?)
-      `,
+      VALUES (?, ?, ?, ?, ?, ?)`,
       [
         SOURCE_TABLE,
         table,
@@ -40,14 +51,14 @@ async function logError(data, msg, table = TARGET_TABLE.map(t => t.table).join('
         MIGRATION_STEP
       ]
     );
-  } catch (_) {
-    // silent
-  }
+  } catch (_) {}
 }
 
 /* ---------- Consumer ---------- */
 async function runUserBookingConsumer() {
+
   await userBookingConsumer.connect();
+
   await userBookingConsumer.subscribe({
     topic: TOPIC,
     fromBeginning: true
@@ -72,8 +83,10 @@ async function runUserBookingConsumer() {
       }));
 
       for (const message of batch.messages) {
+
         let data;
 
+        /* -------- JSON PARSE -------- */
         try {
           data = JSON.parse(message.value.toString());
         } catch {
@@ -82,7 +95,23 @@ async function runUserBookingConsumer() {
           continue;
         }
 
+        /* -------- DATE FILTER -------- */
+        if (!data.created_log) {
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        const bookingDate = parseMysqlDate(data.created_log);
+
+        if (!bookingDate || bookingDate <= MIGRATION_START_DATE) {
+          // Skip old booking BUT acknowledge Kafka message
+          resolveOffset(message.offset);
+          continue;
+        }
+
+        /* -------- PUSH VALID RECORD -------- */
         batchData.forEach(batchItem => {
+
           batchItem.inserts.push([
             data.booking_id,
             data.reg_id,
@@ -91,17 +120,18 @@ async function runUserBookingConsumer() {
             data.service_type || null,
             data.created_log,
             data.booking_status || null,
-            data.source || null,
+            data.actual_source || null,
             data.crm_update_id || null,
             data.city_id || null,
             data.city || null
           ]);
+
         });
 
         resolveOffset(message.offset);
         await heartbeat();
 
-        // Flush when batch size reached
+        /* -------- BATCH FLUSH -------- */
         for (const batchItem of batchData) {
           if (batchItem.inserts.length >= BATCH_SIZE) {
             await insertBatch(batchItem);
@@ -110,7 +140,7 @@ async function runUserBookingConsumer() {
         }
       }
 
-      // Insert remaining rows
+      /* -------- FINAL FLUSH -------- */
       for (const batchItem of batchData) {
         if (batchItem.inserts.length > 0) {
           await insertBatch(batchItem);
@@ -124,6 +154,9 @@ async function runUserBookingConsumer() {
 
 /* ---------- Batch Insert ---------- */
 async function insertBatch({ db, table, inserts }) {
+
+  if (!inserts.length) return;
+
   const SQL = `
     INSERT INTO ${table}
     (
@@ -134,7 +167,7 @@ async function insertBatch({ db, table, inserts }) {
       actual_service_type_migration,
       created_log,
       booking_status,
-      source,
+      actual_source,
       crm_update_id,
       city_id,
       city
@@ -146,16 +179,17 @@ async function insertBatch({ db, table, inserts }) {
       user_veh_id = VALUES(user_veh_id),
       actual_service_type_migration = VALUES(actual_service_type_migration),
       booking_status = VALUES(booking_status),
-      source = VALUES(source),
+      actual_source = VALUES(actual_source),
       crm_update_id = VALUES(crm_update_id),
       city_id = VALUES(city_id),
-      city = VALUES(city)
+      city = VALUES(city);
   `;
 
   try {
     await db.query(SQL, [inserts]);
   } catch (err) {
     console.error(`❌ Batch insert failed for ${table}:`, err.message);
+
     for (const row of inserts) {
       await logError({ booking_id: row[0] }, 'BATCH_INSERT_FAILED: ' + err.message, table);
     }
